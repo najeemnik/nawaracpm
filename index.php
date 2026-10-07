@@ -7,9 +7,11 @@ require_once __DIR__ . '/database.php';
 
 getDB();
 
-// Logout
-if (isset($_GET['logout'])) {
-    session_destroy();
+// Logout is intentionally POST-only to prevent cross-site logout requests.
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['logout'])) {
+    if (isValidCsrfToken($_POST['csrf_token'] ?? null)) {
+        clearCurrentSession();
+    }
     header('Location: index.php');
     exit;
 }
@@ -17,26 +19,82 @@ if (isset($_GET['logout'])) {
 // Login Logic
 $loginError = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
-    $username = trim($_POST['username'] ?? '');
-    $password = trim($_POST['password'] ?? '');
-    
-    $pdo = getDB();
-    $stmt = $pdo->prepare("SELECT * FROM pm_users WHERE username = :un AND active = 1 LIMIT 1");
-    $stmt->execute(['un' => $username]);
-    $user = $stmt->fetch();
+    $username = trim((string)($_POST['username'] ?? ''));
+    $password = (string)($_POST['password'] ?? '');
 
-    if ($user && password_verify($password, $user['password'])) {
-        $_SESSION['user_id'] = $user['id'];
-        $_SESSION['user_data'] = $user;
-        header('Location: index.php');
-        exit;
+    if (!isValidCsrfToken($_POST['csrf_token'] ?? null)) {
+        $loginError = 'درخواست نامعتبر است. لطفاً دوباره تلاش کنید.';
     } else {
-        $loginError = 'نام کاربری یا رمز عبور اشتباه است.';
+        $pdo = getDB();
+        // Store only hashes for throttling; raw IP addresses and usernames are
+        // not persisted in the login-attempt table.
+        $usernameHash = hash('sha256', strtolower($username));
+        $ipHash = hash('sha256', (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
+        $pdo->prepare("DELETE FROM pm_login_attempts WHERE attempted_at < datetime('now','-30 days')")->execute();
+
+        $throttleStmt = $pdo->prepare("
+            SELECT
+                SUM(CASE WHEN username_hash = :username_hash THEN 1 ELSE 0 END) AS username_failures,
+                SUM(CASE WHEN ip_hash = :ip_hash THEN 1 ELSE 0 END) AS ip_failures
+            FROM pm_login_attempts
+            WHERE succeeded = 0
+              AND attempted_at >= datetime('now','-15 minutes')
+        ");
+        $throttleStmt->execute(['username_hash' => $usernameHash, 'ip_hash' => $ipHash]);
+        $throttle = $throttleStmt->fetch() ?: [];
+        $isThrottled = (int)($throttle['username_failures'] ?? 0) >= 8
+            || (int)($throttle['ip_failures'] ?? 0) >= 30;
+
+        if ($isThrottled) {
+            $loginError = 'تلاش‌های زیادی انجام شده است. لطفاً بعداً دوباره کوشش کنید.';
+        } else {
+            $stmt = $pdo->prepare("SELECT * FROM pm_users WHERE username = :un AND active = 1 LIMIT 1");
+            $stmt->execute(['un' => $username]);
+            $user = $stmt->fetch();
+            // Verify against a valid bcrypt hash even for unknown accounts so
+            // the response does not reveal whether a username exists by timing.
+            $passwordHash = $user['password'] ?? '$2y$10$z7pKdikgHqWMYS9bIgDqKOB66143HfQ9Vlxss74CmDbpdoACAtF8K';
+            $passwordMatches = password_verify($password, $passwordHash);
+            $loginSucceeded = $user !== false && $passwordMatches;
+
+            $attemptStmt = $pdo->prepare("
+                INSERT INTO pm_login_attempts(username_hash, ip_hash, succeeded)
+                VALUES(:username_hash, :ip_hash, :succeeded)
+            ");
+            $attemptStmt->execute([
+                'username_hash' => $usernameHash,
+                'ip_hash' => $ipHash,
+                'succeeded' => $loginSucceeded ? 1 : 0
+            ]);
+
+            if ($loginSucceeded) {
+                // Never retain the password hash in the browser session.
+                unset($user['password']);
+                $pdo->prepare("DELETE FROM pm_login_attempts WHERE username_hash = :username_hash AND succeeded = 0")
+                    ->execute(['username_hash' => $usernameHash]);
+
+                session_regenerate_id(true);
+                $_SESSION['user_id'] = (int)$user['id'];
+                $_SESSION['user_data'] = $user;
+                $_SESSION['auth_version'] = (int)($user['auth_version'] ?? 1);
+                unset($_SESSION['csrf_token']);
+                getCsrfToken();
+
+                $loginStmt = $pdo->prepare("UPDATE pm_users SET last_login_at = datetime('now','localtime') WHERE id = :id");
+                $loginStmt->execute(['id' => (int)$user['id']]);
+
+                header('Location: index.php');
+                exit;
+            }
+
+            $loginError = 'نام کاربری یا رمز عبور اشتباه است.';
+        }
     }
 }
 
 $logoExists = file_exists(__DIR__ . '/logo.png');
-$currentUser = getCurrentUser();
+$currentUser = isLoggedIn() ? refreshCurrentUserSession() : null;
+$csrfToken = getCsrfToken();
 
 // LOGIN PAGE
 if (!isLoggedIn()):
@@ -52,6 +110,7 @@ if (!isLoggedIn()):
 <body class="login-body">
     <div class="login-wrapper">
         <form method="post" class="login-card">
+            <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8'); ?>">
             <div class="login-logo">
                 <?php if ($logoExists): ?><img src="logo.png" alt="Logo"><?php else: ?>NawAra<?php endif; ?>
             </div>
@@ -97,11 +156,12 @@ function hasPerm($perm) {
     <title><?php echo htmlspecialchars(APP_NAME, ENT_QUOTES, 'UTF-8'); ?></title>
     <link rel="stylesheet" href="style.css?v=<?php echo app_asset_version('style.css'); ?>">
     <script>
-        const CURRENT_USER = <?php echo json_encode([
+        window.CURRENT_USER = <?php echo json_encode([
             'name' => $currentUser['name'],
             'role' => $currentUser['role'],
             'permissions' => $userPerms
-        ]); ?>;
+        ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+        window.NAWARA_CSRF_TOKEN = <?php echo json_encode($csrfToken, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
     </script>
 </head>
 <body>
@@ -151,10 +211,13 @@ function hasPerm($perm) {
                         </div>
                     </div>
                     <div class="dropdown-divider"></div>
-                    <a href="?logout=1" class="dropdown-item dropdown-logout">
-                        <span>🚪</span>
-                        <span>Logout / خروج</span>
-                    </a>
+                    <form method="post" class="logout-form">
+                        <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8'); ?>">
+                        <button type="submit" name="logout" class="dropdown-item dropdown-logout">
+                            <span>🚪</span>
+                            <span>Logout / خروج</span>
+                        </button>
+                    </form>
                 </div>
             </div>
         </div>
@@ -496,7 +559,7 @@ function hasPerm($perm) {
                 <button class="btn btn-primary" onclick="openUserForm()">＋ Add New User</button>
             </div>
             <table class="proj-table">
-                <thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Actions</th></tr></thead>
+                <thead><tr><th>Name</th><th>Username</th><th>Role / Group</th><th>Status</th><th>Actions</th></tr></thead>
                 <tbody id="usersTableBody"></tbody>
             </table>
         </div>
@@ -526,17 +589,25 @@ function hasPerm($perm) {
                 <div class="fgrid">
                     <div class="fg"><label>Full Name</label><input type="text" id="u_name"></div>
                     <div class="fg"><label>Username</label><input type="text" id="u_username"></div>
-                    <div class="fg"><label>Password <small style="color:#94a3b8;">(leave empty if no change)</small></label><input type="password" id="u_password"></div>
+                    <div class="fg"><label>Password <small style="color:#94a3b8;">(minimum 10 characters; leave empty if no change)</small></label><input type="password" id="u_password" minlength="10"></div>
                     <div class="fg">
-                        <label>Role</label>
+                        <label>System Role</label>
                         <select id="u_role" onchange="togglePerms()">
-                            <option value="user">User (Limited)</option>
-                            <option value="admin">Admin (Full Access)</option>
+                            <option value="user">Employee / Restricted User</option>
+                            <option value="admin">Admin / Head Engineer (Full Access)</option>
+                        </select>
+                    </div>
+                    <div class="fg">
+                        <label>Account Group</label>
+                        <select id="u_account_type" onchange="togglePerms()">
+                            <option value="admin">Admin / Head Engineer</option>
+                            <option value="employee">Employee</option>
+                            <option value="client">Client / Project Owner</option>
                         </select>
                     </div>
                 </div>
                 <div style="margin-top:12px; padding:12px; background:#fef3c7; border-radius:10px; font-size:.85rem; color:#92400e;">
-                    💡 After saving the user, go to the Permissions tab to set access.
+                    💡 Save the user first, then use the Permissions tab to assign projects. Client accounts are deliberately isolated from the legacy internal workspace until the publish-gated client portal is delivered.
                 </div>
             </div>
 

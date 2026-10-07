@@ -1,230 +1,398 @@
 <?php
 /**
  * users.php
+ * Secure user, project-access and account-type management.
  */
 
 require_once __DIR__ . '/database.php';
-
-// چک Login
-if (!isLoggedIn()) {
-    header('Content-Type: application/json');
-    echo json_encode(['success' => false, 'auth' => false, 'error' => 'Not logged in']);
-    exit;
-}
-
-// چک Admin
-$currentUser = getCurrentUser();
-if (!$currentUser || ($currentUser['role'] ?? '') !== 'admin') {
-    header('Content-Type: application/json');
-    echo json_encode(['success' => false, 'error' => 'Admin access required']);
-    exit;
-}
+requireAdminJson();
 
 header('Content-Type: application/json; charset=UTF-8');
 
-// گرفتن action
 $rawInput = file_get_contents('php://input');
-$input = json_decode($rawInput, true) ?: [];
+$input = json_decode($rawInput, true);
+if (!is_array($input)) {
+    $input = [];
+}
+
 $action = $_GET['action'] ?? $input['action'] ?? '';
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if ($method === 'POST') {
+    requireCsrfTokenJson();
+}
+
+function usersOut(array $data, int $status = 200): void
+{
+    http_response_code($status);
+    echo json_encode($data, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+function normalizeUserPermissions($permissions): array
+{
+    $allowed = [
+        'view_all_projects', 'add', 'edit', 'delete', 'print', 'pdf', 'files',
+        'priorities', 'settings', 'manage_users', 'manage_templates',
+        'manage_notifications', 'view_audit_log'
+    ];
+
+    $source = is_array($permissions) ? $permissions : [];
+    $normalized = [];
+    foreach ($allowed as $permission) {
+        $normalized[$permission] = !empty($source[$permission]);
+    }
+
+    return $normalized;
+}
+
+function fetchExistingProjectIds(PDO $pdo, array $projectIds): array
+{
+    $ids = array_values(array_unique(array_filter(array_map('intval', $projectIds), static fn($id) => $id > 0)));
+    if ($ids === []) {
+        return [];
+    }
+
+    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+    $stmt = $pdo->prepare("SELECT id FROM pm_projects WHERE id IN ({$placeholders})");
+    $stmt->execute($ids);
+
+    return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+}
 
 try {
     $pdo = getDB();
 
-    // ============================
-    // LIST USERS
-    // ============================
     if ($action === 'list') {
+        if ($method !== 'GET') {
+            usersOut(['success' => false, 'error' => 'Method Not Allowed'], 405);
+        }
+
         $stmt = $pdo->query("
-            SELECT id, name, username, role, permissions, active 
-            FROM pm_users 
-            ORDER BY id ASC
+            SELECT id, name, username, role, account_type, permissions, active,
+                   created_at, updated_at, last_login_at
+            FROM pm_users
+            ORDER BY active DESC, id ASC
         ");
         $users = $stmt->fetchAll();
-        
-        foreach ($users as &$u) {
-            $u['permissions'] = json_decode($u['permissions'] ?? '{}', true) ?: [];
+
+        foreach ($users as &$user) {
+            $user['permissions'] = json_decode($user['permissions'] ?? '{}', true) ?: [];
         }
-        
-        echo json_encode(['success' => true, 'users' => $users]);
-        exit;
+        unset($user);
+
+        usersOut(['success' => true, 'users' => $users]);
     }
 
-    // ============================
-    // SAVE USER (with access)
-    // ============================
     if ($action === 'save') {
-        $id = (int)($input['id'] ?? 0);
-        $name = trim($input['name'] ?? '');
-        $username = trim($input['username'] ?? '');
-        $password = trim($input['password'] ?? '');
-        $role = ($input['role'] ?? 'user') === 'admin' ? 'admin' : 'user';
-        $perms = json_encode($input['permissions'] ?? [], JSON_UNESCAPED_UNICODE);
-        $projectAccess = $input['project_access'] ?? [];
-
-        if (!$name || !$username) {
-            echo json_encode(['success' => false, 'error' => 'Name and Username are required']);
-            exit;
+        if ($method !== 'POST') {
+            usersOut(['success' => false, 'error' => 'Method Not Allowed'], 405);
         }
 
-        // چک تکراری نبودن
-        $stmt = $pdo->prepare("SELECT id FROM pm_users WHERE username = ? AND id != ?");
-        $stmt->execute([$username, $id]);
-        if ($stmt->fetch()) {
-            echo json_encode(['success' => false, 'error' => 'This username already exists']);
-            exit;
+        $id = (int)($input['id'] ?? 0);
+        $name = trim((string)($input['name'] ?? ''));
+        $username = trim((string)($input['username'] ?? ''));
+        $password = (string)($input['password'] ?? '');
+        $role = ($input['role'] ?? 'user') === 'admin' ? 'admin' : 'user';
+        $accountType = (string)($input['account_type'] ?? ($role === 'admin' ? 'admin' : 'employee'));
+        if (!in_array($accountType, ['admin', 'employee', 'client'], true)) {
+            $accountType = 'employee';
+        }
+        if ($role === 'admin') {
+            $accountType = 'admin';
+        }
+
+        $permissions = normalizeUserPermissions($input['permissions'] ?? []);
+        $permissionsJson = json_encode($permissions, JSON_UNESCAPED_UNICODE);
+        $projectAccessProvided = array_key_exists('project_access', $input);
+        $projectAccess = $input['project_access'] ?? [];
+
+        if ($name === '' || $username === '') {
+            usersOut(['success' => false, 'error' => 'Name and username are required'], 422);
+        }
+        if (strlen($name) > 300 || strlen($username) < 3 || strlen($username) > 64 ||
+            preg_match('/[\x00-\x20\x7F]/', $username)) {
+            usersOut(['success' => false, 'error' => 'Invalid name or username'], 422);
+        }
+        if (($id === 0 && strlen($password) < 10) || ($id > 0 && $password !== '' && strlen($password) < 10)) {
+            usersOut(['success' => false, 'error' => 'Passwords must be at least 10 characters'], 422);
+        }
+
+        $duplicate = $pdo->prepare('SELECT id FROM pm_users WHERE username = ? AND id != ? LIMIT 1');
+        $duplicate->execute([$username, $id]);
+        if ($duplicate->fetch()) {
+            usersOut(['success' => false, 'error' => 'This username already exists'], 409);
+        }
+
+        if ($id > 0) {
+            $existingStmt = $pdo->prepare('SELECT id, role, active FROM pm_users WHERE id = ? LIMIT 1');
+            $existingStmt->execute([$id]);
+            $existingUser = $existingStmt->fetch();
+            if (!$existingUser) {
+                usersOut(['success' => false, 'error' => 'User not found'], 404);
+            }
+            if ($existingUser['role'] === 'admin' && (int)$existingUser['active'] === 1 && $role !== 'admin') {
+                $activeAdminCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users WHERE role = 'admin' AND active = 1")->fetchColumn();
+                if ($activeAdminCount <= 1) {
+                    usersOut(['success' => false, 'error' => 'The last active admin cannot lose admin access'], 422);
+                }
+            }
+        }
+
+        if ($projectAccessProvided && !is_array($projectAccess)) {
+            usersOut(['success' => false, 'error' => 'Invalid project access list'], 422);
+        }
+        $requestedProjectIds = is_array($projectAccess)
+            ? array_values(array_unique(array_filter(array_map('intval', $projectAccess), static fn($projectId) => $projectId > 0)))
+            : [];
+        $validProjectIds = fetchExistingProjectIds($pdo, $requestedProjectIds);
+        if ($projectAccessProvided && count($validProjectIds) !== count($requestedProjectIds)) {
+            usersOut(['success' => false, 'error' => 'One or more selected projects do not exist'], 422);
         }
 
         $pdo->beginTransaction();
-
         try {
             if ($id > 0) {
-                // ویرایش
                 if ($password !== '') {
+                    if (strlen($password) < 10) {
+                        throw new RuntimeException('Password must be at least 10 characters');
+                    }
                     $stmt = $pdo->prepare("
-                        UPDATE pm_users 
-                        SET name=?, username=?, password=?, role=?, permissions=? 
-                        WHERE id=?
+                        UPDATE pm_users
+                        SET name = ?, username = ?, password = ?, role = ?, account_type = ?,
+                            permissions = ?, auth_version = auth_version + 1,
+                            password_changed_at = datetime('now','localtime'),
+                            updated_at = datetime('now','localtime')
+                        WHERE id = ?
                     ");
-                    $stmt->execute([$name, $username, password_hash($password, PASSWORD_DEFAULT), $role, $perms, $id]);
+                    $stmt->execute([
+                        $name, $username, password_hash($password, PASSWORD_DEFAULT), $role,
+                        $accountType, $permissionsJson, $id
+                    ]);
                 } else {
                     $stmt = $pdo->prepare("
-                        UPDATE pm_users 
-                        SET name=?, username=?, role=?, permissions=? 
-                        WHERE id=?
+                        UPDATE pm_users
+                        SET name = ?, username = ?, role = ?, account_type = ?, permissions = ?,
+                            auth_version = auth_version + 1,
+                            updated_at = datetime('now','localtime')
+                        WHERE id = ?
                     ");
-                    $stmt->execute([$name, $username, $role, $perms, $id]);
+                    $stmt->execute([$name, $username, $role, $accountType, $permissionsJson, $id]);
                 }
                 $userId = $id;
             } else {
-                // جدید
-                if (!$password) {
-                    $pdo->rollBack();
-                    echo json_encode(['success' => false, 'error' => 'Password is required for new user']);
-                    exit;
-                }
-                
                 $stmt = $pdo->prepare("
-                    INSERT INTO pm_users (name, username, password, role, permissions) 
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO pm_users
+                        (name, username, password, role, account_type, permissions, auth_version,
+                         password_changed_at, updated_at)
+                    VALUES
+                        (?, ?, ?, ?, ?, ?, 1, datetime('now','localtime'), datetime('now','localtime'))
                 ");
-                $stmt->execute([$name, $username, password_hash($password, PASSWORD_DEFAULT), $role, $perms]);
+                $stmt->execute([
+                    $name, $username, password_hash($password, PASSWORD_DEFAULT), $role,
+                    $accountType, $permissionsJson
+                ]);
                 $userId = (int)$pdo->lastInsertId();
             }
 
-            // حذف دسترسی‌های قدیمی
-            $stmt = $pdo->prepare("DELETE FROM pm_project_access WHERE user_id = ?");
-            $stmt->execute([$userId]);
+            $membershipRole = $accountType === 'client'
+                ? 'client'
+                : ($role === 'admin' ? 'project_admin' : 'employee');
 
-            // اضافه کردن دسترسی‌های جدید
-            if (is_array($projectAccess) && !empty($projectAccess)) {
+            // An update that does not explicitly include project_access keeps
+            // its existing assignments. An explicit [] intentionally clears it.
+            if ($id === 0 || $projectAccessProvided) {
+                // Keep the legacy table working while the new PWA moves to
+                // pm_project_members. This also removes old access rows on update.
+                $pdo->prepare('DELETE FROM pm_project_access WHERE user_id = ?')->execute([$userId]);
+                $pdo->prepare('DELETE FROM pm_project_members WHERE user_id = ?')->execute([$userId]);
+
                 $insertAccess = $pdo->prepare("
-                    INSERT INTO pm_project_access 
-                    (user_id, project_id, can_view, can_edit, can_delete, can_print, can_pdf, can_files)
+                    INSERT INTO pm_project_access
+                        (user_id, project_id, can_view, can_edit, can_delete, can_print, can_pdf, can_files)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ");
+                $insertMembership = $pdo->prepare("
+                    INSERT INTO pm_project_members
+                        (project_id, user_id, membership_role, permissions, active, created_by)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                ");
 
-                // گرفتن general permissions برای اعمال به project access
-                $permsArr = json_decode($perms, true) ?: [];
+                $currentAdmin = getCurrentUser();
+                $createdBy = (int)($currentAdmin['id'] ?? 0) ?: null;
 
-                foreach ($projectAccess as $projectId) {
-                    $projectId = (int)$projectId;
-                    if ($projectId <= 0) continue;
-                    
+                foreach ($validProjectIds as $projectId) {
                     $insertAccess->execute([
                         $userId,
                         $projectId,
-                        1, // view (چون در لیست انتخاب شده)
-                        !empty($permsArr['edit']) ? 1 : 0,
-                        !empty($permsArr['delete']) ? 1 : 0,
-                        !empty($permsArr['print']) ? 1 : 0,
-                        !empty($permsArr['pdf']) ? 1 : 0,
-                        !empty($permsArr['files']) ? 1 : 0
+                        1,
+                        !empty($permissions['edit']) ? 1 : 0,
+                        !empty($permissions['delete']) ? 1 : 0,
+                        !empty($permissions['print']) ? 1 : 0,
+                        !empty($permissions['pdf']) ? 1 : 0,
+                        !empty($permissions['files']) ? 1 : 0
+                    ]);
+                    $insertMembership->execute([
+                        $projectId,
+                        $userId,
+                        $membershipRole,
+                        $permissionsJson,
+                        $createdBy
                     ]);
                 }
+            } elseif ($id > 0) {
+                // Preserve project membership while keeping its effective
+                // legacy/new-model action flags synchronized with the user.
+                $pdo->prepare("
+                    UPDATE pm_project_access
+                    SET can_edit = ?, can_delete = ?, can_print = ?, can_pdf = ?, can_files = ?
+                    WHERE user_id = ?
+                ")->execute([
+                    !empty($permissions['edit']) ? 1 : 0,
+                    !empty($permissions['delete']) ? 1 : 0,
+                    !empty($permissions['print']) ? 1 : 0,
+                    !empty($permissions['pdf']) ? 1 : 0,
+                    !empty($permissions['files']) ? 1 : 0,
+                    $userId
+                ]);
+                $pdo->prepare("
+                    UPDATE pm_project_members
+                    SET membership_role = ?, permissions = ?, updated_at = datetime('now','localtime')
+                    WHERE user_id = ?
+                ")->execute([$membershipRole, $permissionsJson, $userId]);
             }
 
             $pdo->commit();
-            echo json_encode([
-                'success' => true, 
-                'message' => $id > 0 ? 'User updated' : 'User created',
+            recordAuditEvent(
+                'user',
+                $userId,
+                $id > 0 ? 'updated' : 'created',
+                null,
+                ['role' => $role, 'account_type' => $accountType, 'project_access_updated' => $id === 0 || $projectAccessProvided, 'project_access_count' => count($validProjectIds)]
+            );
+            usersOut([
+                'success' => true,
+                'message' => $id > 0 ? 'User updated. Existing sessions were revoked.' : 'User created',
                 'id' => $userId
             ]);
         } catch (Throwable $e) {
-            $pdo->rollBack();
-            echo json_encode(['success' => false, 'error' => 'Save failed: ' . $e->getMessage()]);
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log('NawAra user save failed: ' . $e->getMessage());
+            usersOut(['success' => false, 'error' => 'User could not be saved'], 500);
         }
-        exit;
     }
 
-    // ============================
-    // GET USER ACCESS
-    // ============================
     if ($action === 'get_user_access') {
+        if ($method !== 'GET') {
+            usersOut(['success' => false, 'error' => 'Method Not Allowed'], 405);
+        }
+
         $userId = (int)($_GET['user_id'] ?? 0);
-        
         if ($userId <= 0) {
-            echo json_encode(['success' => false, 'error' => 'Invalid user']);
-            exit;
+            usersOut(['success' => false, 'error' => 'Invalid user'], 422);
         }
 
         $projects = $pdo->query("
-            SELECT id, project_name, client_name 
-            FROM pm_projects 
+            SELECT id, project_name, client_name
+            FROM pm_projects
             ORDER BY project_name ASC
         ")->fetchAll();
-        
-        $stmt = $pdo->prepare("SELECT * FROM pm_project_access WHERE user_id = ?");
+
+        $stmt = $pdo->prepare('SELECT * FROM pm_project_access WHERE user_id = ?');
         $stmt->execute([$userId]);
         $accesses = $stmt->fetchAll();
-        
+
         $accessMap = [];
-        foreach ($accesses as $a) {
-            $accessMap[(int)$a['project_id']] = $a;
+        foreach ($accesses as $access) {
+            $accessMap[(int)$access['project_id']] = $access;
         }
 
         $result = [];
-        foreach ($projects as $p) {
-            $acc = $accessMap[(int)$p['id']] ?? null;
+        foreach ($projects as $project) {
+            $access = $accessMap[(int)$project['id']] ?? null;
             $result[] = [
-                'id' => $p['id'],
-                'name' => $p['project_name'],
-                'client' => $p['client_name'],
-                'access' => $acc ? [
-                    'view' => (int)$acc['can_view'],
-                    'edit' => (int)$acc['can_edit'],
-                    'delete' => (int)$acc['can_delete'],
-                    'print' => (int)$acc['can_print'],
-                    'pdf' => (int)$acc['can_pdf'],
-                    'files' => (int)$acc['can_files']
+                'id' => (int)$project['id'],
+                'name' => $project['project_name'],
+                'client' => $project['client_name'],
+                'access' => $access ? [
+                    'view' => (bool)$access['can_view'],
+                    'edit' => (bool)$access['can_edit'],
+                    'delete' => (bool)$access['can_delete'],
+                    'print' => (bool)$access['can_print'],
+                    'pdf' => (bool)$access['can_pdf'],
+                    'files' => (bool)$access['can_files']
                 ] : null
             ];
         }
-        
-        echo json_encode(['success' => true, 'projects' => $result]);
-        exit;
+
+        usersOut(['success' => true, 'projects' => $result]);
     }
 
-    // ============================
-    // DELETE USER
-    // ============================
-    if ($action === 'delete') {
-        $id = (int)($input['id'] ?? 0);
-        
-        if ($id === (int)($_SESSION['user_id'] ?? 0)) {
-            echo json_encode(['success' => false, 'error' => 'You cannot delete yourself']);
-            exit;
+    if ($action === 'activate') {
+        if ($method !== 'POST') {
+            usersOut(['success' => false, 'error' => 'Method Not Allowed'], 405);
         }
 
-        $stmt = $pdo->prepare("DELETE FROM pm_users WHERE id = ?");
+        $id = (int)($input['id'] ?? 0);
+        if ($id <= 0) {
+            usersOut(['success' => false, 'error' => 'Invalid user'], 422);
+        }
+
+        $stmt = $pdo->prepare("
+            UPDATE pm_users
+            SET active = 1, auth_version = auth_version + 1, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        ");
         $stmt->execute([$id]);
-        
-        echo json_encode(['success' => true, 'message' => 'User deleted']);
-        exit;
+        if ($stmt->rowCount() === 0) {
+            usersOut(['success' => false, 'error' => 'User not found'], 404);
+        }
+        recordAuditEvent('user', $id, 'activated');
+        usersOut(['success' => true, 'message' => 'User activated']);
     }
 
-    // Default
-    echo json_encode(['success' => false, 'error' => 'Unknown action: ' . $action]);
+    if ($action === 'delete') {
+        if ($method !== 'POST') {
+            usersOut(['success' => false, 'error' => 'Method Not Allowed'], 405);
+        }
 
+        $id = (int)($input['id'] ?? 0);
+        $currentUser = getCurrentUser();
+        if ($id <= 0) {
+            usersOut(['success' => false, 'error' => 'Invalid user'], 422);
+        }
+        if ($id === (int)($currentUser['id'] ?? 0)) {
+            usersOut(['success' => false, 'error' => 'You cannot deactivate yourself'], 422);
+        }
+
+        $targetStmt = $pdo->prepare('SELECT id, role, active FROM pm_users WHERE id = ? LIMIT 1');
+        $targetStmt->execute([$id]);
+        $target = $targetStmt->fetch();
+        if (!$target) {
+            usersOut(['success' => false, 'error' => 'User not found'], 404);
+        }
+
+        if ($target['role'] === 'admin' && (int)$target['active'] === 1) {
+            $activeAdminCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users WHERE role = 'admin' AND active = 1")->fetchColumn();
+            if ($activeAdminCount <= 1) {
+                usersOut(['success' => false, 'error' => 'The last active admin cannot be deactivated'], 422);
+            }
+        }
+
+        $stmt = $pdo->prepare("
+            UPDATE pm_users
+            SET active = 0, auth_version = auth_version + 1, updated_at = datetime('now','localtime')
+            WHERE id = ?
+        ");
+        $stmt->execute([$id]);
+        recordAuditEvent('user', $id, 'deactivated');
+
+        usersOut(['success' => true, 'message' => 'User deactivated and sessions revoked']);
+    }
+
+    usersOut(['success' => false, 'error' => 'Unknown action'], 400);
 } catch (Throwable $e) {
-    echo json_encode(['success' => false, 'error' => 'Server error: ' . $e->getMessage()]);
+    error_log('NawAra users endpoint failed: ' . $e->getMessage());
+    usersOut(['success' => false, 'error' => 'Server error'], 500);
 }

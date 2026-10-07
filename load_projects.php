@@ -16,6 +16,16 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     jsonOut(['error' => 'Method Not Allowed'], 405);
 }
 
+$currentUser = getCurrentUser();
+// The legacy workspace has no publish-gated client projection yet. Never
+// expose its internal project payload, metadata, or staff details to clients.
+if (isClientAccount($currentUser)) {
+    if (isset($_GET['id']) || isset($_GET['meta'])) {
+        jsonOut(['error' => 'Client workspace is not available yet'], 403);
+    }
+    jsonOut(['success' => true, 'projects' => []]);
+}
+
 try {
     $pdo = getDB();
 
@@ -31,26 +41,8 @@ try {
     $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
 
     if ($id > 0) {
-        // چک permission دیدن این پروژه
-        $user = function_exists('getCurrentUser') ? getCurrentUser() : null;
-        $isAdmin = $user && ($user['role'] ?? '') === 'admin';
-        
-        if (!$isAdmin && $user) {
-            $perms = json_decode($user['permissions'] ?? '{}', true) ?: [];
-            $viewAll = !empty($perms['view_all_projects']);
-            
-            if (!$viewAll) {
-                $stmt = $pdo->prepare("
-                    SELECT can_view FROM pm_project_access 
-                    WHERE user_id = :uid AND project_id = :pid LIMIT 1
-                ");
-                $stmt->execute(['uid' => $user['id'], 'pid' => $id]);
-                $canView = $stmt->fetchColumn();
-                
-                if (!$canView) {
-                    jsonOut(['error' => 'You do not have permission to view this project'], 403);
-                }
-            }
+        if (!canViewProject($id)) {
+            jsonOut(['error' => 'You do not have permission to view this project'], 403);
         }
 
         $project = getProjectPayload($pdo, $id);
@@ -69,32 +61,14 @@ try {
         ]);
     }
 
-    // فیلتر بر اساس دسترسی کاربر
-    $user = function_exists('getCurrentUser') ? getCurrentUser() : null;
-    $isAdmin = $user && ($user['role'] ?? '') === 'admin';
-    
+    // Scope every project query to the server-side authorization result.
+    $allowedProjectIds = getAllowedProjectIds();
     $whereAccess = '';
-    
-    if (!$isAdmin && $user) {
-        $perms = json_decode($user['permissions'] ?? '{}', true) ?: [];
-        $viewAll = !empty($perms['view_all_projects']);
-        
-        if (!$viewAll) {
-            // فقط پروژه‌های مجاز
-            $stmt = $pdo->prepare("
-                SELECT project_id FROM pm_project_access 
-                WHERE user_id = :uid AND can_view = 1
-            ");
-            $stmt->execute(['uid' => $user['id']]);
-            $allowedIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
-            
-            if (empty($allowedIds)) {
-                jsonOut(['success' => true, 'projects' => []]);
-            }
-            
-            $ids = implode(',', array_map('intval', $allowedIds));
-            $whereAccess = " AND p.id IN ($ids)";
+    if ($allowedProjectIds !== ['*']) {
+        if ($allowedProjectIds === []) {
+            jsonOut(['success' => true, 'projects' => []]);
         }
+        $whereAccess = ' AND p.id IN (' . implode(',', array_map('intval', $allowedProjectIds)) . ')';
     }
 
     $search = trim($_GET['search'] ?? '');
@@ -137,7 +111,8 @@ try {
     jsonOut(['success' => true, 'projects' => $projects]);
 
 } catch (Throwable $e) {
-    jsonOut(['error' => 'Server error: ' . $e->getMessage()], 500);
+    error_log('NawAra project load failed: ' . $e->getMessage());
+    jsonOut(['error' => 'Server error'], 500);
 }
 
 
@@ -147,7 +122,7 @@ try {
 function getUserAccessForProject($pdo, $projectId) {
     $user = function_exists('getCurrentUser') ? getCurrentUser() : null;
     
-    if (!$user) {
+    if (!$user || isClientAccount($user)) {
         return ['view'=>false, 'edit'=>false, 'delete'=>false, 'print'=>false, 'pdf'=>false, 'files'=>false];
     }
     

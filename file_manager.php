@@ -1,78 +1,10 @@
 <?php
 /**
  * file_manager.php
- * Full File Manager per Project
+ * Project file manager with server-side project authorization.
  */
 
 require_once __DIR__ . '/database.php';
-requireLoginJson();
-// چک permission برای پروژه
-$projectId = (int)($_GET['project_id'] ?? $_POST['project_id'] ?? 0);
-$user = getCurrentUser();
-$isAdmin = $user && ($user['role'] ?? '') === 'admin';
-
-if (!$isAdmin && $projectId > 0) {
-    // چک کن آیا دسترسی files دارد
-    $perms = json_decode($user['permissions'] ?? '{}', true) ?: [];
-    $hasFilesPerm = !empty($perms['files']);
-    $viewAll = !empty($perms['view_all_projects']);
-    
-    // اگر view_all_projects دارد و files general permission دارد
-    if ($viewAll && $hasFilesPerm) {
-        // OK - allowed
-    } else {
-        // چک کن project-specific access دارد
-        try {
-            $pdo = getDB();
-            $stmt = $pdo->prepare("
-                SELECT can_files FROM pm_project_access 
-                WHERE user_id = :uid AND project_id = :pid 
-                LIMIT 1
-            ");
-            $stmt->execute(['uid' => $user['id'], 'pid' => $projectId]);
-            $canFiles = $stmt->fetchColumn();
-            
-            if (!$canFiles) {
-                $action = $_GET['action'] ?? $_POST['action'] ?? '';
-                if ($action === 'download') {
-                    die('You do not have permission to access files');
-                } else {
-                    header('Content-Type: application/json');
-                    echo json_encode([
-                        'success' => false, 
-                        'error' => 'You do not have permission to access files for this project'
-                    ]);
-                    exit;
-                }
-            }
-        } catch (Throwable $e) {
-            // در صورت خطا اجازه نده
-            header('Content-Type: application/json');
-            echo json_encode(['success' => false, 'error' => 'Permission check failed']);
-            exit;
-        }
-    }
-}
-
-$action = $_GET['action'] ?? $_POST['action'] ?? '';
-
-if ($action === 'download') {
-    if (function_exists('requireLoginPage')) {
-        requireLoginPage();
-    }
-} else {
-    if (function_exists('requireLoginJson')) {
-        requireLoginJson();
-    }
-}
-
-define('FM_BASE_DIR', __DIR__ . '/uploads');
-define('FM_MAX_UPLOAD_SIZE', 500 * 1024 * 1024);
-
-$blockedExtensions = [
-    'php', 'phtml', 'phar', 'php3', 'php4', 'php5', 'php7', 'php8',
-    'pht', 'shtml', 'htaccess', 'cgi', 'pl', 'py', 'sh', 'exe', 'bat'
-];
 
 function fm_json(array $data, int $code = 200): void
 {
@@ -81,6 +13,89 @@ function fm_json(array $data, int $code = 200): void
     echo json_encode($data, JSON_UNESCAPED_UNICODE);
     exit;
 }
+
+function fm_access_denied(string $action): void
+{
+    if ($action === 'download') {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=UTF-8');
+        exit('You do not have permission to access these files.');
+    }
+
+    fm_json(['success' => false, 'error' => 'You do not have permission to access files for this project'], 403);
+}
+
+$action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
+$jsonActions = ['create_folder', 'rename', 'delete'];
+
+if ($action === 'download') {
+    requireLoginPage();
+} else {
+    requireLoginJson();
+}
+
+$fmJsonInput = [];
+if (in_array($action, $jsonActions, true)) {
+    $decoded = json_decode(file_get_contents('php://input'), true);
+    if (!is_array($decoded)) {
+        fm_json(['success' => false, 'error' => 'Invalid JSON'], 400);
+    }
+    $fmJsonInput = $decoded;
+}
+
+// A project ID is resolved from one canonical source per action. This prevents
+// authorization from checking a different ID than the mutation uses.
+if (in_array($action, ['list', 'download'], true)) {
+    $projectId = (int)($_GET['project_id'] ?? 0);
+} elseif ($action === 'upload') {
+    $projectId = (int)($_POST['project_id'] ?? 0);
+} elseif (in_array($action, $jsonActions, true)) {
+    $projectId = (int)($fmJsonInput['project_id'] ?? 0);
+} else {
+    $projectId = 0;
+}
+
+$validActions = ['list', 'create_folder', 'upload', 'download', 'rename', 'delete'];
+if (!in_array($action, $validActions, true)) {
+    fm_json(['success' => false, 'error' => 'Invalid action'], 400);
+}
+
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+if ((in_array($action, ['list', 'download'], true) && $method !== 'GET') ||
+    (in_array($action, ['create_folder', 'upload', 'rename', 'delete'], true) && $method !== 'POST')) {
+    fm_json(['success' => false, 'error' => 'Method Not Allowed'], 405);
+}
+if ($method === 'POST') {
+    requireCsrfTokenJson();
+}
+
+if ($projectId <= 0) {
+    if ($action === 'download') {
+        http_response_code(400);
+        exit('Invalid project ID');
+    }
+    fm_json(['success' => false, 'error' => 'Invalid project ID'], 400);
+}
+
+if (!canViewProject($projectId) || !canDoOnProject($projectId, 'files')) {
+    fm_access_denied($action);
+}
+
+$configuredUploadsDir = trim((string)(getenv('NAWARA_UPLOADS_DIR') ?: ''));
+$uploadsDir = $configuredUploadsDir !== ''
+    ? rtrim($configuredUploadsDir, DIRECTORY_SEPARATOR)
+    : __DIR__ . '/uploads';
+define('FM_BASE_DIR', $uploadsDir);
+define('FM_MAX_UPLOAD_SIZE', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_MB') ?: 50)) * 1024 * 1024);
+define('FM_MAX_UPLOAD_FILES', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_FILES') ?: 10)));
+define('FM_MAX_UPLOAD_TOTAL_SIZE', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_TOTAL_MB') ?: 100)) * 1024 * 1024);
+
+define('FM_ALLOWED_EXTENSIONS', [
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'txt',
+    'jpg', 'jpeg', 'png', 'gif', 'webp',
+    'dwg', 'dxf', 'ifc', 'rvt',
+    'zip', 'rar', '7z'
+]);
 
 function fm_table_exists(PDO $pdo, string $table): bool
 {
@@ -147,54 +162,73 @@ function fm_ensure_default_folders(int $projectId): void
 function fm_clean_name(string $name): string
 {
     $name = trim($name);
-    $name = str_replace(['/', '\\', "\0", '..'], '', $name);
+    if ($name === '' || $name === '.' || $name === '..' || strlen($name) > 180) {
+        return '';
+    }
+
+    // Names are a single path component; do not silently turn a supplied path
+    // into a different file name.
+    if (str_contains($name, '/') || str_contains($name, '\\') || str_contains($name, "\0")) {
+        return '';
+    }
+    if (preg_match('/[\x00-\x1F\x7F]/', $name)) {
+        return '';
+    }
+
     return $name;
+}
+
+function fm_path_is_within(string $path, string $root): bool
+{
+    return $path === $root || str_starts_with($path, $root . DIRECTORY_SEPARATOR);
 }
 
 function fm_safe_path(int $projectId, string $relative): ?string
 {
     $root = fm_project_root($projectId);
+    if (!is_dir($root) && !@mkdir($root, 0755, true) && !is_dir($root)) {
+        return null;
+    }
 
-    if (!is_dir($root)) {
-        @mkdir($root, 0755, true);
+    $rootReal = realpath($root);
+    if ($rootReal === false) {
+        return null;
     }
 
     $relative = str_replace('\\', '/', $relative);
     $relative = trim($relative, '/');
-
-    if ($relative === '') {
-        return realpath($root) ?: $root;
-    }
-
-    $parts = explode('/', $relative);
-    $clean = [];
-    foreach ($parts as $part) {
-        $part = trim($part);
-        if ($part === '' || $part === '.') continue;
-        if ($part === '..') return null;
-        $part = fm_clean_name($part);
-        if ($part === '') continue;
-        $clean[] = $part;
-    }
-
-    $target = $root . '/' . implode('/', $clean);
-
-    $real = realpath($target);
-    if ($real === false) {
-        $rootReal = realpath($root);
-        if ($rootReal === false) return $target;
-        $normalized = $rootReal . '/' . implode('/', $clean);
-        return $normalized;
-    }
-
-    $rootReal = realpath($root);
-    if ($rootReal === false) return null;
-
-    if (strpos($real, $rootReal) !== 0) {
+    if (strlen($relative) > 2000) {
         return null;
     }
+    if ($relative === '') {
+        return $rootReal;
+    }
 
-    return $real;
+    $current = $rootReal;
+    foreach (explode('/', $relative) as $part) {
+        if ($part === '' || $part === '.' || $part === '..') {
+            return null;
+        }
+        $part = fm_clean_name($part);
+        if ($part === '') {
+            return null;
+        }
+
+        $candidate = $current . DIRECTORY_SEPARATOR . $part;
+        // Resolve each existing component. This blocks traversal through a
+        // symlink even when the final target does not exist yet.
+        if (file_exists($candidate) || is_link($candidate)) {
+            $resolved = realpath($candidate);
+            if ($resolved === false || !fm_path_is_within($resolved, $rootReal)) {
+                return null;
+            }
+            $current = $resolved;
+        } else {
+            $current = $candidate;
+        }
+    }
+
+    return fm_path_is_within($current, $rootReal) ? $current : null;
 }
 
 function fm_size_text(int $bytes): string
@@ -249,7 +283,7 @@ try {
         if ($absolute === null) fm_json(['success' => false, 'error' => 'Invalid path'], 400);
 
         if (!is_dir($absolute)) {
-            @mkdir($absolute, 0755, true);
+            fm_json(['success' => false, 'error' => 'Folder not found'], 404);
         }
 
         if ($path === '') {
@@ -265,6 +299,11 @@ try {
 
             $full = $absolute . '/' . $item;
             $itemPath = ltrim($path . '/' . $item, '/');
+
+            // Symlinks are never listed or followed by the file manager.
+            if (is_link($full)) {
+                continue;
+            }
 
             if (is_dir($full)) {
                 $isDefault = ($path === '' && in_array($item, fm_default_folders(), true));
@@ -317,8 +356,7 @@ try {
      * CREATE FOLDER
      */
     if ($action === 'create_folder') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!is_array($input)) fm_json(['success' => false, 'error' => 'Invalid JSON'], 400);
+        $input = $fmJsonInput;
 
         $projectId = (int)($input['project_id'] ?? 0);
         $path = (string)($input['path'] ?? '');
@@ -345,6 +383,7 @@ try {
             fm_json(['success' => false, 'error' => 'Failed to create folder'], 500);
         }
 
+        recordAuditEvent('file_folder', null, 'created', $projectId, ['path' => ltrim($path . '/' . $folderName, '/')]);
         fm_json(['success' => true, 'message' => 'Folder created']);
     }
 
@@ -373,6 +412,13 @@ try {
         if (!is_array($names)) {
             $names = [$names]; $tmps = [$tmps]; $sizes = [$sizes]; $errors = [$errors];
         }
+        if (count($names) > FM_MAX_UPLOAD_FILES) {
+            fm_json(['success' => false, 'error' => 'Too many files in one upload'], 422);
+        }
+        $requestTotalSize = array_sum(array_map('intval', is_array($sizes) ? $sizes : []));
+        if ($requestTotalSize > FM_MAX_UPLOAD_TOTAL_SIZE) {
+            fm_json(['success' => false, 'error' => 'Total upload size is too large'], 422);
+        }
 
         $uploaded = [];
         $uploadErrors = [];
@@ -388,9 +434,12 @@ try {
             if ($size > FM_MAX_UPLOAD_SIZE) { $uploadErrors[] = "$original: file too large"; continue; }
 
             $ext = fm_ext($original);
-            global $blockedExtensions;
-            if (in_array($ext, $blockedExtensions, true)) {
-                $uploadErrors[] = "$original: this file type is blocked";
+            if ($ext === '' || !in_array($ext, FM_ALLOWED_EXTENSIONS, true)) {
+                $uploadErrors[] = "$original: this file type is not allowed";
+                continue;
+            }
+            if (!is_uploaded_file($tmp)) {
+                $uploadErrors[] = "$original: invalid upload";
                 continue;
             }
 
@@ -408,6 +457,9 @@ try {
             $uploaded[] = basename($destination);
         }
 
+        if ($uploaded !== []) {
+            recordAuditEvent('file', null, 'uploaded', $projectId, ['path' => $path, 'files' => $uploaded]);
+        }
         fm_json([
             'success' => true,
             'message' => count($uploaded) . ' file(s) uploaded',
@@ -429,12 +481,12 @@ try {
         $file = fm_safe_path($projectId, $path);
         if ($file === null || !is_file($file)) die('File not found');
 
-        $name = basename($file);
+        $name = str_replace(["\r", "\n", '"'], '', basename($file));
 
         header('Content-Description: File Transfer');
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . $name . '"');
-        header('Content-Length: ' . filesize($file));
+        header("Content-Disposition: attachment; filename*=UTF-8''" . rawurlencode($name));
+        header('Content-Length: ' . (string)filesize($file));
         header('Cache-Control: private');
         header('Pragma: public');
 
@@ -446,8 +498,7 @@ try {
      * RENAME
      */
     if ($action === 'rename') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!is_array($input)) fm_json(['success' => false, 'error' => 'Invalid JSON'], 400);
+        $input = $fmJsonInput;
 
         $projectId = (int)($input['project_id'] ?? 0);
         $path = (string)($input['path'] ?? '');
@@ -468,9 +519,8 @@ try {
         }
 
         $ext = fm_ext($newName);
-        global $blockedExtensions;
-        if (is_file($target) && in_array($ext, $blockedExtensions, true)) {
-            fm_json(['success' => false, 'error' => 'This file extension is blocked'], 400);
+        if (is_file($target) && ($ext === '' || !in_array($ext, FM_ALLOWED_EXTENSIONS, true))) {
+            fm_json(['success' => false, 'error' => 'This file extension is not allowed'], 400);
         }
 
         $newPath = dirname($target) . '/' . $newName;
@@ -483,6 +533,7 @@ try {
             fm_json(['success' => false, 'error' => 'Rename failed'], 500);
         }
 
+        recordAuditEvent('file', null, 'renamed', $projectId, ['from' => $path, 'to' => ltrim(dirname($path) . '/' . $newName, './')]);
         fm_json(['success' => true, 'message' => 'Renamed successfully']);
     }
 
@@ -490,8 +541,7 @@ try {
      * DELETE
      */
     if ($action === 'delete') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!is_array($input)) fm_json(['success' => false, 'error' => 'Invalid JSON'], 400);
+        $input = $fmJsonInput;
 
         $projectId = (int)($input['project_id'] ?? 0);
         $path = (string)($input['path'] ?? '');
@@ -510,15 +560,22 @@ try {
             }
         }
 
+        $entityType = is_dir($target) ? 'file_folder' : 'file';
         if (!fm_delete_recursive($target)) {
             fm_json(['success' => false, 'error' => 'Delete failed'], 500);
         }
 
+        recordAuditEvent($entityType, null, 'deleted', $projectId, ['path' => $path]);
         fm_json(['success' => true, 'message' => 'Deleted successfully']);
     }
 
     fm_json(['success' => false, 'error' => 'Invalid action'], 400);
 
 } catch (Throwable $e) {
-    fm_json(['success' => false, 'error' => 'Server error: ' . $e->getMessage()], 500);
+    error_log('NawAra file manager failed: ' . $e->getMessage());
+    if ($action === 'download') {
+        http_response_code(500);
+        exit('Unable to process the download.');
+    }
+    fm_json(['success' => false, 'error' => 'Server error'], 500);
 }

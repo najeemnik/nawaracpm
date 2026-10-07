@@ -5,6 +5,7 @@
  */
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/migrations.php';
 
 function getDB(): PDO
 {
@@ -25,15 +26,18 @@ function getDB(): PDO
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
         $pdo->exec('PRAGMA foreign_keys = ON');
         $pdo->exec('PRAGMA journal_mode = WAL');
+        $pdo->exec('PRAGMA busy_timeout = 5000');
 
         createTables($pdo);
+        runDatabaseMigrations($pdo);
         seedDefaultData($pdo);
 
         return $pdo;
     } catch (Throwable $e) {
+        error_log('NawAra database initialization failed: ' . $e->getMessage());
         header('Content-Type: application/json; charset=UTF-8');
         http_response_code(500);
-        echo json_encode(['error' => 'Database connection failed: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        echo json_encode(['error' => 'Database connection failed'], JSON_UNESCAPED_UNICODE);
         exit;
     }
 }
@@ -153,14 +157,23 @@ function seedDefaultData(PDO $pdo): void
     try {
         $userCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users")->fetchColumn();
         if ($userCount === 0) {
+            $initialPassword = (string)(getenv('NAWARA_INITIAL_ADMIN_PASSWORD') ?: '');
+            if (strlen($initialPassword) < 12) {
+                $initialPassword = bin2hex(random_bytes(16));
+                error_log('NawAra created the initial admin account. Set its password immediately. Temporary password: ' . $initialPassword);
+            }
+
             $stmt = $pdo->prepare("
-                INSERT INTO pm_users (name, username, password, role, permissions) 
-                VALUES (:name, :username, :password, :role, :permissions)
+                INSERT INTO pm_users
+                    (name, username, password, role, account_type, permissions, auth_version, password_changed_at, updated_at)
+                VALUES
+                    (:name, :username, :password, :role, 'admin', :permissions, 1,
+                     datetime('now','localtime'), datetime('now','localtime'))
             ");
             $stmt->execute([
                 'name' => 'Administrator',
                 'username' => 'admin',
-                'password' => password_hash('NawAra@2025', PASSWORD_DEFAULT),
+                'password' => password_hash($initialPassword, PASSWORD_DEFAULT),
                 'role' => 'admin',
                 'permissions' => '{}'
             ]);

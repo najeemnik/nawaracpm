@@ -6,8 +6,11 @@
 
 require_once __DIR__ . '/database.php';
 
-if (function_exists('requireLoginJson')) {
-    requireLoginJson();
+if (function_exists('requirePermissionJson')) {
+    requirePermissionJson('priorities');
+}
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    requireCsrfTokenJson();
 }
 
 function pri_json(array $data, int $code = 200): void
@@ -44,6 +47,11 @@ try {
 
     if ($_SERVER['REQUEST_METHOD'] === 'GET' && $action === '') {
         $action = 'list';
+    }
+
+    $writeActions = ['add', 'toggle', 'edit', 'delete', 'add_engineer'];
+    if (in_array($action, $writeActions, true) && $_SERVER['REQUEST_METHOD'] !== 'POST') {
+        pri_json(['success' => false, 'error' => 'Method Not Allowed'], 405);
     }
 
     /**
@@ -119,12 +127,12 @@ try {
         $input = json_decode(file_get_contents('php://input'), true);
         if (!is_array($input)) pri_json(['success' => false, 'error' => 'Invalid JSON'], 400);
 
-        $title = trim($input['title'] ?? '');
-        if ($title === '') pri_json(['success' => false, 'error' => 'Task title is required'], 400);
+        $title = trim((string)($input['title'] ?? ''));
+        if ($title === '' || strlen($title) > 500) pri_json(['success' => false, 'error' => 'A valid task title is required'], 422);
 
         $assigneeId = !empty($input['assignee_id']) ? (int)$input['assignee_id'] : null;
         $priority = $input['priority'] ?? 'medium';
-        $dueDate = trim($input['due_date'] ?? '');
+        $dueDate = trim((string)($input['due_date'] ?? ''));
 
         $validPriorities = ['critical', 'high', 'medium', 'low'];
         if (!in_array($priority, $validPriorities, true)) {
@@ -142,10 +150,12 @@ try {
             'due_date' => $dueDate
         ]);
 
+        $newId = (int)$pdo->lastInsertId();
+        recordAuditEvent('priority', $newId, 'created', null, ['priority' => $priority]);
         pri_json([
             'success' => true,
             'message' => 'Task added',
-            'id' => (int)$pdo->lastInsertId()
+            'id' => $newId
         ]);
     }
 
@@ -178,6 +188,7 @@ try {
             'completed_at' => $completedAt,
             'id' => $id
         ]);
+        recordAuditEvent('priority', $id, $newDone === 1 ? 'completed' : 'reopened');
 
         pri_json(['success' => true, 'message' => 'Task updated']);
     }
@@ -190,17 +201,21 @@ try {
         if (!is_array($input)) pri_json(['success' => false, 'error' => 'Invalid JSON'], 400);
 
         $id = (int)($input['id'] ?? 0);
-        $title = trim($input['title'] ?? '');
+        $title = trim((string)($input['title'] ?? ''));
 
-        if ($id <= 0) pri_json(['success' => false, 'error' => 'Invalid task ID'], 400);
-        if ($title === '') pri_json(['success' => false, 'error' => 'Title is required'], 400);
+        if ($id <= 0) pri_json(['success' => false, 'error' => 'Invalid task ID'], 422);
+        if ($title === '' || strlen($title) > 500) pri_json(['success' => false, 'error' => 'A valid title is required'], 422);
 
         $assigneeId = !empty($input['assignee_id']) ? (int)$input['assignee_id'] : null;
         $priority = $input['priority'] ?? 'medium';
-        $dueDate = trim($input['due_date'] ?? '');
+        $dueDate = trim((string)($input['due_date'] ?? ''));
 
         $validPriorities = ['critical', 'high', 'medium', 'low'];
         if (!in_array($priority, $validPriorities, true)) $priority = 'medium';
+
+        $existsStmt = $pdo->prepare("SELECT id FROM pm_priorities WHERE id = :id LIMIT 1");
+        $existsStmt->execute(['id' => $id]);
+        if (!$existsStmt->fetch()) pri_json(['success' => false, 'error' => 'Task not found'], 404);
 
         $stmt = $pdo->prepare("
             UPDATE pm_priorities 
@@ -217,6 +232,7 @@ try {
             'due_date' => $dueDate,
             'id' => $id
         ]);
+        recordAuditEvent('priority', $id, 'updated', null, ['priority' => $priority]);
 
         pri_json(['success' => true, 'message' => 'Task updated']);
     }
@@ -233,6 +249,8 @@ try {
 
         $stmt = $pdo->prepare("DELETE FROM pm_priorities WHERE id = :id");
         $stmt->execute(['id' => $id]);
+        if ($stmt->rowCount() === 0) pri_json(['success' => false, 'error' => 'Task not found'], 404);
+        recordAuditEvent('priority', $id, 'deleted');
 
         pri_json(['success' => true, 'message' => 'Task deleted']);
     }
@@ -241,11 +259,12 @@ try {
      * ADD ENGINEER
      */
     if ($action === 'add_engineer') {
+        requirePermissionJson('settings');
         $input = json_decode(file_get_contents('php://input'), true);
         if (!is_array($input)) pri_json(['success' => false, 'error' => 'Invalid JSON'], 400);
 
-        $name = trim($input['name'] ?? '');
-        if ($name === '') pri_json(['success' => false, 'error' => 'Name is required'], 400);
+        $name = trim((string)($input['name'] ?? ''));
+        if ($name === '' || strlen($name) > 150) pri_json(['success' => false, 'error' => 'A valid name is required'], 422);
 
         $stmt = $pdo->prepare("SELECT id FROM pm_engineers WHERE name = :name LIMIT 1");
         $stmt->execute(['name' => $name]);
@@ -263,6 +282,7 @@ try {
             $newId = (int)$pdo->lastInsertId();
         }
 
+        recordAuditEvent('engineer', $newId, 'created_or_reactivated');
         pri_json([
             'success' => true,
             'id' => $newId,
@@ -273,5 +293,6 @@ try {
     pri_json(['success' => false, 'error' => 'Invalid action'], 400);
 
 } catch (Throwable $e) {
-    pri_json(['success' => false, 'error' => 'Server error: ' . $e->getMessage()], 500);
+    error_log('NawAra priorities endpoint failed: ' . $e->getMessage());
+    pri_json(['success' => false, 'error' => 'Server error'], 500);
 }

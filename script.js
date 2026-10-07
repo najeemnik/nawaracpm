@@ -23,6 +23,7 @@ let META = { engineers: [], statuses: [], sections: [] };
 let PROJECTS = [];
 let CURRENT_PROJECT = null;
 let ALL_USERS = [];
+let USER_PROJECT_ACCESS_LOADED = false;
 
 const esc = s => {
     const d = document.createElement('div');
@@ -77,7 +78,17 @@ function toast(msg, type = 'inf') {
 async function api(url, opts = {}) {
     loading(true);
     try {
-        const res = await fetch(url, opts);
+        const request = { ...opts };
+        const method = (request.method || 'GET').toUpperCase();
+        if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+            const headers = new Headers(request.headers || {});
+            if (typeof window.NAWARA_CSRF_TOKEN === 'string' && window.NAWARA_CSRF_TOKEN) {
+                headers.set('X-CSRF-Token', window.NAWARA_CSRF_TOKEN);
+            }
+            request.headers = headers;
+        }
+
+        const res = await fetch(url, request);
         const data = await res.json();
         if (data && data.auth === false) {
             window.location.href = 'index.php';
@@ -600,11 +611,11 @@ function deleteProject(id, name) {
 }
 
 function doPrint(id) {
-    const w = window.open('generate_pdf.php?id=' + id, '_blank');
+    const w = window.open('generate_pdf.php?id=' + id + '&mode=print', '_blank');
     if (w) w.addEventListener('load', () => setTimeout(() => w.print(), 700));
 }
 
-function doPdf(id) { window.open('generate_pdf.php?id=' + id, '_blank'); }
+function doPdf(id) { window.open('generate_pdf.php?id=' + id + '&mode=pdf', '_blank'); }
 
 // ============================================
 // SEARCH
@@ -837,15 +848,13 @@ function priRenderTasks(tasks) {
 }
 
 async function priToggle(id) {
-    const res = await fetch('priorities.php?action=toggle', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
-    const data = await res.json();
+    const data = await api('priorities.php?action=toggle', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
     if (data.success) await priLoadTasks();
 }
 
 async function priDelete(id) {
     if (!confirm('Delete this task?')) return;
-    const res = await fetch('priorities.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
-    const data = await res.json();
+    const data = await api('priorities.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
     if (data.success) { toast('Deleted', 'ok'); await priLoadTasks(); }
 }
 
@@ -865,8 +874,7 @@ async function priAddTask() {
     if (assigneeEl && assigneeEl.value === '__add_new__') {
         const name = prompt('Enter new person name:');
         if (!name || !name.trim()) { assigneeEl.value = ''; return; }
-        const res = await fetch('priorities.php?action=add_engineer', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name.trim()}) });
-        const data = await res.json();
+        const data = await api('priorities.php?action=add_engineer', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name.trim()}) });
         if (data.success) { toast('Added', 'ok'); await priLoadTasks(); }
         return;
     }
@@ -878,8 +886,7 @@ async function priAddTask() {
         due_date: $('priNewDueDate') ? $('priNewDueDate').value : ''
     };
     
-    const res = await fetch('priorities.php?action=add', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
-    const data = await res.json();
+    const data = await api('priorities.php?action=add', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
     if (data.success) {
         toast('Task added', 'ok');
         if (titleEl) titleEl.value = '';
@@ -919,10 +926,13 @@ async function loadUsers() {
             <tr>
                 <td>${esc(u.name)}</td>
                 <td>${esc(u.username)}</td>
-                <td><span class="badge ${u.role==='admin'?'b-ip':'b-ok'}">${esc(u.role)}</span></td>
+                <td><span class="badge ${u.role==='admin'?'b-ip':'b-ok'}">${esc(u.role === 'admin' ? 'Admin / Head Engineer' : (u.account_type === 'client' ? 'Client / Owner' : 'Employee'))}</span></td>
+                <td><span class="badge ${parseInt(u.active)===1?'b-ok':'b-rv'}">${parseInt(u.active)===1 ? 'Active' : 'Inactive'}</span></td>
                 <td>
                     <button class="btn btn-sm btn-edit" onclick="editUser(${u.id})">✏️</button>
-                    <button class="btn btn-sm btn-del" onclick="deleteUser(${u.id})">🗑</button>
+                    ${parseInt(u.active) === 1
+                        ? `<button class="btn btn-sm btn-del" onclick="deleteUser(${u.id})" title="Deactivate">⛔</button>`
+                        : `<button class="btn btn-sm btn-open" onclick="activateUser(${u.id})" title="Activate">↻</button>`}
                 </td>
             </tr>`).join('');
     }
@@ -940,8 +950,10 @@ function showUserTab(tab, btn) {
 }
 
 function openUserForm() {
+    USER_PROJECT_ACCESS_LOADED = false;
     ['u_id','u_name','u_username','u_password'].forEach(id => { const el = $(id); if (el) el.value = id === 'u_id' ? '0' : ''; });
     const role = $('u_role'); if (role) role.value = 'user';
+    const accountType = $('u_account_type'); if (accountType) accountType.value = 'employee';
     ['view_all_projects','add','edit','delete','print','pdf','files','priorities','settings'].forEach(p => {
         const el = $('p_' + p); if (el) el.checked = false;
     });
@@ -952,6 +964,7 @@ function openUserForm() {
 }
 
 function editUser(id) {
+    USER_PROJECT_ACCESS_LOADED = false;
     const u = ALL_USERS.find(x => x.id == id);
     if (!u) return;
     $('u_id').value = u.id;
@@ -959,6 +972,7 @@ function editUser(id) {
     $('u_username').value = u.username;
     $('u_password').value = '';
     $('u_role').value = u.role;
+    const accountType = $('u_account_type'); if (accountType) accountType.value = u.account_type || (u.role === 'admin' ? 'admin' : 'employee');
     ['view_all_projects','add','edit','delete','print','pdf','files','priorities','settings'].forEach(p => {
         const el = $('p_' + p);
         if (el) el.checked = u.permissions && u.permissions[p] === true;
@@ -971,10 +985,21 @@ function editUser(id) {
 
 function togglePerms() {
     const box = $('u_perms_box');
-    if (!box) return;
     const role = $('u_role') ? $('u_role').value : 'user';
-    box.style.opacity = role === 'admin' ? '0.4' : '1';
-    box.style.pointerEvents = role === 'admin' ? 'none' : 'auto';
+    const accountType = $('u_account_type');
+    if (accountType) {
+        if (role === 'admin') {
+            accountType.value = 'admin';
+            accountType.disabled = true;
+        } else {
+            if (accountType.value === 'admin') accountType.value = 'employee';
+            accountType.disabled = false;
+        }
+    }
+    if (!box) return;
+    const isAdmin = role === 'admin';
+    box.style.opacity = isAdmin ? '0.4' : '1';
+    box.style.pointerEvents = isAdmin ? 'none' : 'auto';
 }
 
 function toggleProjectsList() {
@@ -999,9 +1024,9 @@ async function loadSpecificProjects() {
     box.innerHTML = '<div style="color:#94a3b8;text-align:center;">Loading...</div>';
 
     try {
-        const res = await fetch('users.php?action=get_user_access&user_id=' + userId);
-        const data = await res.json();
+        const data = await api('users.php?action=get_user_access&user_id=' + encodeURIComponent(userId));
         if (!data.success) { box.innerHTML = '<div style="color:red;">Error: ' + (data.error || 'Failed') + '</div>'; return; }
+        USER_PROJECT_ACCESS_LOADED = true;
 
         if (!data.projects || !data.projects.length) {
             box.innerHTML = '<div style="color:#94a3b8;text-align:center;">No projects available</div>';
@@ -1030,10 +1055,12 @@ window.saveUser = async function() {
     const username = $('u_username') ? $('u_username').value.trim() : '';
     const password = $('u_password') ? $('u_password').value : '';
     const role = $('u_role') ? $('u_role').value : 'user';
+    const accountType = $('u_account_type') ? $('u_account_type').value : 'employee';
 
     if (!name) { alert('Name is required'); return; }
     if (!username) { alert('Username is required'); return; }
-    if (id === '0' && !password) { alert('Password is required for new user'); return; }
+    if (id === '0' && password.length < 10) { alert('A password of at least 10 characters is required for a new user'); return; }
+    if (id !== '0' && password && password.length < 10) { alert('A new password must be at least 10 characters'); return; }
 
     const permissions = {};
     ['view_all_projects','add','edit','delete','print','pdf','files','priorities','settings'].forEach(p => {
@@ -1050,18 +1077,22 @@ window.saveUser = async function() {
     const payload = {
         action: 'save',
         id, name, username, password, role,
-        permissions,
-        project_access: selectedProjects
+        account_type: accountType,
+        permissions
     };
+    // Do not accidentally remove existing assignments when the administrator
+    // saves only the profile tab. Once the access tab is loaded, an explicit
+    // empty selection deliberately clears access.
+    if (USER_PROJECT_ACCESS_LOADED) {
+        payload.project_access = selectedProjects;
+    }
 
     try {
-        const res = await fetch('users.php', {
+        const data = await api('users.php', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload)
         });
-        const text = await res.text();
-        const data = JSON.parse(text);
 
         if (data.success) {
             toast(data.message || 'User saved', 'ok');
@@ -1077,10 +1108,15 @@ window.saveUser = async function() {
 };
 
 async function deleteUser(id) {
-    if (!confirm('Delete this user?')) return;
-    const res = await fetch('users.php', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'delete',id}) });
-    const d = await res.json();
-    if (d.success) { toast('Deleted', 'ok'); loadUsers(); }
+    if (!confirm('Deactivate this user? Their active sessions will be revoked.')) return;
+    const d = await api('users.php', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'delete',id}) });
+    if (d.success) { toast('User deactivated', 'ok'); loadUsers(); }
+    else toast(d.error || 'Failed', 'err');
+}
+
+async function activateUser(id) {
+    const d = await api('users.php', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:'activate',id}) });
+    if (d.success) { toast('User activated', 'ok'); loadUsers(); }
     else toast(d.error || 'Failed', 'err');
 }
 
@@ -1133,8 +1169,7 @@ async function fmLoadCurrentFolder() {
     try {
         loading(true);
         const url = 'file_manager.php?action=list&project_id=' + encodeURIComponent(FM_PROJECT_ID) + '&path=' + encodeURIComponent(FM_CURRENT_PATH);
-        const res = await fetch(url);
-        const data = await res.json();
+        const data = await api(url);
 
         if (data && data.auth === false) { window.location.href = 'index.php'; return; }
         if (!data.success) { box.innerHTML = `<div class="files-empty">${esc(data.error || 'Failed')}</div>`; return; }
@@ -1219,8 +1254,7 @@ async function fmCreateFolder() {
     if (!name || !name.trim()) return;
     loading(true);
     try {
-        const res = await fetch('file_manager.php?action=create_folder', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path:FM_CURRENT_PATH, name:name.trim() }) });
-        const data = await res.json();
+        const data = await api('file_manager.php?action=create_folder', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path:FM_CURRENT_PATH, name:name.trim() }) });
         if (data.success) { toast('Folder created', 'ok'); fmLoadCurrentFolder(); }
         else toast(data.error || 'Failed', 'err');
     } catch(e) { toast('Error: '+e.message,'err'); }
@@ -1236,8 +1270,7 @@ async function fmUploadFiles(fileList) {
     for (let i = 0; i < fileList.length; i++) formData.append('files[]', fileList[i]);
     loading(true);
     try {
-        const res = await fetch('file_manager.php?action=upload', { method:'POST', body:formData });
-        const data = await res.json();
+        const data = await api('file_manager.php?action=upload', { method:'POST', body:formData });
         if (data.success) { toast(data.message || 'Uploaded', 'ok'); fmLoadCurrentFolder(); }
         else toast(data.error || 'Failed', 'err');
         const input = $('fmUploadInput'); if (input) input.value = '';
@@ -1250,8 +1283,7 @@ async function fmRename(path, currentName) {
     if (!newName || !newName.trim() || newName === currentName) return;
     loading(true);
     try {
-        const res = await fetch('file_manager.php?action=rename', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path, new_name:newName.trim() }) });
-        const data = await res.json();
+        const data = await api('file_manager.php?action=rename', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path, new_name:newName.trim() }) });
         if (data.success) { toast('Renamed', 'ok'); fmLoadCurrentFolder(); }
         else toast(data.error || 'Failed', 'err');
     } catch(e) { toast('Error: '+e.message,'err'); }
@@ -1262,8 +1294,7 @@ async function fmDelete(path, name, isFolder) {
     if (!confirm((isFolder ? 'Delete folder "' : 'Delete file "') + name + '"?')) return;
     loading(true);
     try {
-        const res = await fetch('file_manager.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path }) });
-        const data = await res.json();
+        const data = await api('file_manager.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ project_id:FM_PROJECT_ID, path }) });
         if (data.success) { toast('Deleted', 'ok'); fmLoadCurrentFolder(); }
         else toast(data.error || 'Failed', 'err');
     } catch(e) { toast('Error: '+e.message,'err'); }

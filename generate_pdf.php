@@ -4,12 +4,15 @@
  */
 
 require_once __DIR__ . '/database.php';
-requireLoginPage();
 $id = isset($_GET['id']) ? (int)$_GET['id'] : 0;
+$mode = ($_GET['mode'] ?? 'pdf') === 'print' ? 'print' : 'pdf';
 
 if ($id <= 0) {
-    die('Invalid project ID');
+    http_response_code(400);
+    exit('Invalid project ID');
 }
+
+requireProjectActionPage($id, $mode);
 
 $pdo = getDB();
 $project = getProjectPayload($pdo, $id);

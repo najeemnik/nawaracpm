@@ -11,6 +11,7 @@ header('Content-Type: application/json; charset=UTF-8');
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     jsonOut(['error' => 'Method Not Allowed'], 405);
 }
+requireCsrfTokenJson();
 
 $input = json_decode(file_get_contents('php://input'), true);
 
@@ -19,6 +20,25 @@ if (!is_array($input)) {
 }
 
 $action = $input['action'] ?? 'save_project';
+
+$settingsActions = ['add_engineer', 'add_status', 'save_engineers', 'save_statuses', 'save_sections'];
+if (in_array($action, $settingsActions, true)) {
+    requirePermissionJson('settings');
+}
+
+if ($action === 'save_project') {
+    $projectForAuthorization = $input['project'] ?? [];
+    if (!is_array($projectForAuthorization)) {
+        jsonOut(['error' => 'Invalid project payload'], 400);
+    }
+    $projectIdForAuthorization = (int)($projectForAuthorization['id'] ?? 0);
+
+    if ($projectIdForAuthorization > 0) {
+        requireProjectActionJson($projectIdForAuthorization, 'edit');
+    } else {
+        requirePermissionJson('add');
+    }
+}
 
 try {
     $pdo = getDB();
@@ -214,12 +234,12 @@ try {
             $order++;
         }
 
-        $pdo->commit();
-
         $ids = $pdo->query("SELECT id FROM pm_projects")->fetchAll();
         foreach ($ids as $row) {
             updateProjectProgress($pdo, (int)$row['id']);
         }
+
+        $pdo->commit();
 
         jsonOut([
             'success' => true,
@@ -339,12 +359,12 @@ try {
             }
         }
 
-        $pdo->commit();
-
         $ids = $pdo->query("SELECT id FROM pm_projects")->fetchAll();
         foreach ($ids as $row) {
             updateProjectProgress($pdo, (int)$row['id']);
         }
+
+        $pdo->commit();
 
         jsonOut([
             'success' => true,
@@ -357,19 +377,32 @@ try {
         $project = $input['project'] ?? [];
         $values = $input['values'] ?? [];
 
-        $projectName = trim($project['project_name'] ?? '');
-        $clientName = trim($project['client_name'] ?? '');
-
-        if ($projectName === '') {
-            jsonOut(['error' => 'Project name is required'], 400);
+        if (!is_array($project) || !is_array($values)) {
+            jsonOut(['error' => 'Invalid project payload'], 400);
         }
 
-        if ($clientName === '') {
-            jsonOut(['error' => 'Client name is required'], 400);
+        $projectName = trim((string)($project['project_name'] ?? ''));
+        $clientName = trim((string)($project['client_name'] ?? ''));
+
+        if ($projectName === '' || strlen($projectName) > 300) {
+            jsonOut(['error' => 'A valid project name is required'], 422);
+        }
+
+        if ($clientName === '' || strlen($clientName) > 300) {
+            jsonOut(['error' => 'A valid client name is required'], 422);
         }
 
         $id = (int)($project['id'] ?? 0);
+        $isNewProject = $id === 0;
         $leadEngineerId = !empty($project['lead_engineer_id']) ? (int)$project['lead_engineer_id'] : null;
+
+        if ($id > 0) {
+            $existsStmt = $pdo->prepare("SELECT id FROM pm_projects WHERE id = :id LIMIT 1");
+            $existsStmt->execute(['id' => $id]);
+            if (!$existsStmt->fetch()) {
+                jsonOut(['error' => 'Project not found'], 404);
+            }
+        }
 
         $pdo->beginTransaction();
 
@@ -411,6 +444,42 @@ try {
                 'description' => trim($project['description'] ?? ''),
             ]);
             $id = (int)$pdo->lastInsertId();
+
+            // A non-admin who is allowed to create a project must retain view/edit
+            // access to the project they just created.
+            $creator = getCurrentUser();
+            $creatorPermissions = json_decode($creator['permissions'] ?? '{}', true) ?: [];
+            if (($creator['role'] ?? '') !== 'admin' && empty($creatorPermissions['view_all_projects'])) {
+                $accessStmt = $pdo->prepare("
+                    INSERT OR IGNORE INTO pm_project_access
+                        (user_id, project_id, can_view, can_edit, can_delete, can_print, can_pdf, can_files)
+                    VALUES (:user_id, :project_id, 1, 1, :can_delete, :can_print, :can_pdf, :can_files)
+                ");
+                $accessStmt->execute([
+                    'user_id' => (int)$creator['id'],
+                    'project_id' => $id,
+                    'can_delete' => !empty($creatorPermissions['delete']) ? 1 : 0,
+                    'can_print' => !empty($creatorPermissions['print']) ? 1 : 0,
+                    'can_pdf' => !empty($creatorPermissions['pdf']) ? 1 : 0,
+                    'can_files' => !empty($creatorPermissions['files']) ? 1 : 0
+                ]);
+
+                $memberRole = (($creator['account_type'] ?? 'employee') === 'client')
+                    ? 'client'
+                    : 'employee';
+                $memberStmt = $pdo->prepare("
+                    INSERT OR IGNORE INTO pm_project_members
+                        (project_id, user_id, membership_role, permissions, active, created_by)
+                    VALUES (:project_id, :user_id, :membership_role, :permissions, 1, :created_by)
+                ");
+                $memberStmt->execute([
+                    'project_id' => $id,
+                    'user_id' => (int)$creator['id'],
+                    'membership_role' => $memberRole,
+                    'permissions' => json_encode($creatorPermissions, JSON_UNESCAPED_UNICODE),
+                    'created_by' => (int)$creator['id']
+                ]);
+            }
         }
 
         $defaultStatusId = getDefaultStatusId($pdo);
@@ -479,9 +548,9 @@ try {
             }
         }
 
-        $pdo->commit();
-
         $progress = updateProjectProgress($pdo, $id);
+        $pdo->commit();
+        recordAuditEvent('project', $id, $isNewProject ? 'created' : 'updated', $id, ['progress' => $progress]);
 
         jsonOut([
             'success' => true,
@@ -498,5 +567,6 @@ try {
         $pdo->rollBack();
     }
 
-    jsonOut(['error' => 'Server error: ' . $e->getMessage()], 500);
+    error_log('NawAra project save failed: ' . $e->getMessage());
+    jsonOut(['error' => 'Server error'], 500);
 }

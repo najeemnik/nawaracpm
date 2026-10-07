@@ -1228,6 +1228,17 @@ body{
     background: #f1f5f9;
 }
 
+.logout-form {
+    margin: 0;
+}
+
+button.dropdown-item {
+    width: 100%;
+    border: 0;
+    font: inherit;
+    text-align: left;
+}
+
 .dropdown-item span:first-child {
     font-size: 1.1rem;
 }
