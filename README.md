@@ -18,6 +18,7 @@ NawAra is being evolved incrementally into a simple, installable construction-pr
 - [Secure deployment guide (Dari)](docs/04_DEPLOYMENT_SECURITY_FA.md)
 - [Stage 2 test report (Dari)](docs/05_STAGE2_TEST_REPORT_FA.md)
 - [Phase 2.5 remediation test report (Dari)](docs/07_PHASE_2_5_REMEDIATION_TEST_REPORT_FA.md)
+- [Task schema foundation (Dari)](docs/08_TASK_SCHEMA_FOUNDATION_FA.md)
 
 ## Deployment note
 

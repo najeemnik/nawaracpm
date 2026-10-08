@@ -9,7 +9,7 @@
 
 function dbTableHasColumn(PDO $pdo, string $table, string $column): bool
 {
-    $allowedTables = ['pm_users', 'pm_projects', 'pm_audit_log', 'pm_priorities'];
+    $allowedTables = ['pm_users', 'pm_projects', 'pm_audit_log', 'pm_priorities', 'pm_tasks'];
     if (!in_array($table, $allowedTables, true)) {
         throw new InvalidArgumentException('Unsupported migration table');
     }
@@ -799,6 +799,143 @@ function prioritiesIntegrityMigration(PDO $pdo): void
     ");
 }
 
+/**
+ * Client collaboration and delivery-tracking foundation.
+ *
+ * pm_tasks already models internal work. These tables add the three pieces the
+ * approved product design still needs before any Task API is built: dated
+ * project milestones, actual work time per employee, and one publish-gated
+ * surface through which a project owner sees updates, files and approvals.
+ */
+function clientCollaborationFoundationMigration(PDO $pdo): void
+{
+    // Actual start/completion time is tracked per task. Work logs below keep
+    // the detailed per-session history behind it.
+    dbAddColumnIfMissing($pdo, 'pm_tasks', 'actual_start_at', "TEXT NOT NULL DEFAULT ''");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_milestones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            section_id INTEGER NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            target_date TEXT NOT NULL DEFAULT '',
+            progress_threshold INTEGER NULL
+                CHECK(progress_threshold IS NULL
+                      OR (progress_threshold >= 0 AND progress_threshold <= 100)),
+            status TEXT NOT NULL DEFAULT 'planned'
+                CHECK(status IN ('planned','in_progress','reached','missed','cancelled')),
+            reached_at TEXT NOT NULL DEFAULT '',
+            notify_client INTEGER NOT NULL DEFAULT 0 CHECK(notify_client IN (0,1)),
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_by INTEGER NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            deleted_at TEXT NOT NULL DEFAULT '',
+            deleted_by INTEGER NULL,
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(section_id) REFERENCES pm_sections(id) ON DELETE SET NULL,
+            FOREIGN KEY(created_by) REFERENCES pm_users(id) ON DELETE SET NULL,
+            FOREIGN KEY(deleted_by) REFERENCES pm_users(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pm_milestones_project_status
+            ON pm_milestones(project_id, status, target_date);
+        CREATE INDEX IF NOT EXISTS idx_pm_milestones_deleted
+            ON pm_milestones(deleted_at, project_id);
+
+        CREATE TABLE IF NOT EXISTS pm_work_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL DEFAULT '',
+            minutes INTEGER NOT NULL DEFAULT 0 CHECK(minutes >= 0),
+            note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(task_id) REFERENCES pm_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES pm_users(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pm_work_logs_task_user
+            ON pm_work_logs(task_id, user_id, started_at);
+        CREATE INDEX IF NOT EXISTS idx_pm_work_logs_user_started
+            ON pm_work_logs(user_id, started_at);
+
+        CREATE TABLE IF NOT EXISTS pm_client_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            task_id INTEGER NULL,
+            milestone_id INTEGER NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            published_by INTEGER NULL,
+            published_at TEXT NOT NULL DEFAULT '',
+            approval_required INTEGER NOT NULL DEFAULT 0 CHECK(approval_required IN (0,1)),
+            comments_enabled INTEGER NOT NULL DEFAULT 0 CHECK(comments_enabled IN (0,1)),
+            files_enabled INTEGER NOT NULL DEFAULT 0 CHECK(files_enabled IN (0,1)),
+            decision TEXT NOT NULL DEFAULT 'not_requested'
+                CHECK(decision IN ('not_requested','awaiting_approval','approved','changes_requested')),
+            decision_comment TEXT NOT NULL DEFAULT '',
+            decided_by INTEGER NULL,
+            decided_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            deleted_at TEXT NOT NULL DEFAULT '',
+            deleted_by INTEGER NULL,
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES pm_tasks(id) ON DELETE SET NULL,
+            FOREIGN KEY(milestone_id) REFERENCES pm_milestones(id) ON DELETE SET NULL,
+            FOREIGN KEY(published_by) REFERENCES pm_users(id) ON DELETE SET NULL,
+            FOREIGN KEY(decided_by) REFERENCES pm_users(id) ON DELETE SET NULL,
+            FOREIGN KEY(deleted_by) REFERENCES pm_users(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pm_client_updates_project_published
+            ON pm_client_updates(project_id, published_at DESC, deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_pm_client_updates_decision
+            ON pm_client_updates(decision, published_at);
+
+        -- A project owner must never be shown an unpublished draft, and must
+        -- never be asked to approve something that was not published to them.
+        CREATE TRIGGER IF NOT EXISTS trg_pm_client_updates_approval_needs_publish_insert
+        BEFORE INSERT ON pm_client_updates
+        FOR EACH ROW
+        WHEN NEW.approval_required = 1 AND NEW.published_at = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'Client approval requires a published update');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_client_updates_approval_needs_publish_update
+        BEFORE UPDATE OF approval_required, published_at ON pm_client_updates
+        FOR EACH ROW
+        WHEN NEW.approval_required = 1 AND NEW.published_at = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'Client approval requires a published update');
+        END;
+
+        -- A rejection without a reason is operationally useless and leads to
+        -- disputes on construction deliverables.
+        CREATE TRIGGER IF NOT EXISTS trg_pm_client_updates_reason_required
+        BEFORE UPDATE OF decision ON pm_client_updates
+        FOR EACH ROW
+        WHEN NEW.decision = 'changes_requested' AND TRIM(NEW.decision_comment) = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'A reason is required when changes are requested');
+        END;
+
+        -- A milestone can only be marked reached once.
+        CREATE TRIGGER IF NOT EXISTS trg_pm_milestones_reached_timestamp
+        BEFORE UPDATE OF status ON pm_milestones
+        FOR EACH ROW
+        WHEN NEW.status IN ('reached','missed') AND NEW.reached_at = ''
+        BEGIN
+            SELECT RAISE(ABORT, 'Reached and missed milestones require a timestamp');
+        END;
+    ");
+}
+
 function getDatabaseMigrations(): array
 {
     return [
@@ -828,6 +965,7 @@ function getDatabaseMigrations(): array
         '20261008_006_task_attachment_foundation' => 'taskAttachmentFoundationMigration',
         '20261008_007_security_design_remediation' => 'securityRemediationMigration',
         '20261008_008_priorities_integrity' => 'prioritiesIntegrityMigration',
+        '20261008_009_client_collaboration_foundation' => 'clientCollaborationFoundationMigration',
     ];
 }
 
