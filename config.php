@@ -114,6 +114,47 @@ define('APP_UPLOADS_DIR', $uploadsDir);
 define('DB_PATH', APP_DATA_DIR . '/database.sqlite');
 
 /**
+ * Private error log.
+ *
+ * PHP must never print errors to the browser in production, but silently
+ * discarding them would also hide attacks and failures. Errors are therefore
+ * written to a log file inside the private data directory, which is outside
+ * the web root and excluded from version control.
+ */
+$nawaraLogDir = rtrim(trim((string)(getenv('NAWARA_LOG_DIR') ?: '')), '/');
+if ($nawaraLogDir === '') {
+    $nawaraLogDir = APP_DATA_DIR . '/logs';
+}
+if (!is_dir($nawaraLogDir) && !@mkdir($nawaraLogDir, 0750, true) && !is_dir($nawaraLogDir)) {
+    nawaraConfigurationError('Unable to create the private log directory');
+}
+$nawaraResolvedLogDir = realpath($nawaraLogDir);
+if ($nawaraResolvedLogDir === false || !is_dir($nawaraResolvedLogDir) || !is_writable($nawaraResolvedLogDir)) {
+    nawaraConfigurationError('The private log directory is not writable by PHP');
+}
+define('APP_LOG_DIR', $nawaraResolvedLogDir);
+ini_set('error_log', APP_LOG_DIR . '/php-error.log');
+
+/**
+ * Cross-subdomain session cookie.
+ *
+ * Nawara Studio — CPM and Nawara Tasks are installed as two separate PWAs on
+ * two subdomains. A single login must work for both, so the session cookie is
+ * optionally scoped to the shared parent domain, for example ".nawara.af".
+ *
+ * When the variable is empty the cookie stays host-only, which is the safer
+ * default for single-domain installations.
+ */
+$sessionCookieDomain = strtolower(trim((string)(getenv('NAWARA_SESSION_COOKIE_DOMAIN') ?: '')));
+if ($sessionCookieDomain !== ''
+    && !preg_match('/^\.[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/', $sessionCookieDomain)
+) {
+    nawaraConfigurationError(
+        'NAWARA_SESSION_COOKIE_DOMAIN must be a dot-prefixed parent domain, for example .example.com'
+    );
+}
+
+/**
  * SESSION
  */
 $configuredSecureCookie = strtolower(trim((string)(getenv('NAWARA_SESSION_SECURE') ?: '')));
@@ -139,6 +180,7 @@ if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
         'lifetime' => $sessionLifetime,
         'path' => '/',
+        'domain' => $sessionCookieDomain,
         'httponly' => true,
         'secure' => $secureCookie,
         'samesite' => 'Lax'
