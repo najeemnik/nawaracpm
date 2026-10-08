@@ -1725,7 +1725,7 @@ if ($action === 'attachment_upload') {
         taskFail('You do not have permission to upload files to this task', 403);
     }
 
-    $originalName = basename((string)($input['filename'] ?? ''));
+    $originalName = basename(str_replace('\\', '/', (string)($input['filename'] ?? '')));
     $originalName = taskText($originalName, 255, 'Filename');
     $contentType = strtolower(trim((string)($input['content_type'] ?? '')));
 
@@ -1741,6 +1741,10 @@ if ($action === 'attachment_upload') {
     if ($dataB64 === '') {
         taskFail('File content is required', 422);
     }
+    // Reject oversized payloads BEFORE decoding (10 MB binary ≈ 13.99 MB base64).
+    if (strlen($dataB64) > 14 * 1024 * 1024 + 8) {
+        taskFail('File is larger than 10 MB', 422);
+    }
     $bytes = base64_decode($dataB64, true);
     if ($bytes === false) {
         taskFail('File content is not valid base64', 422);
@@ -1750,6 +1754,30 @@ if ($action === 'attachment_upload') {
     }
     if (strlen($bytes) > 10 * 1024 * 1024) {
         taskFail('File is larger than 10 MB', 422);
+    }
+
+    // Content sniffing: the declared type must match the actual magic bytes so
+    // arbitrary payloads can never masquerade as images/PDFs in storage.
+    $magicOk = false;
+    switch ($contentType) {
+        case 'image/png':
+            $magicOk = str_starts_with($bytes, "\x89PNG\r\n\x1a\n");
+            break;
+        case 'image/jpeg':
+            $magicOk = str_starts_with($bytes, "\xFF\xD8\xFF");
+            break;
+        case 'image/gif':
+            $magicOk = str_starts_with($bytes, 'GIF87a') || str_starts_with($bytes, 'GIF89a');
+            break;
+        case 'image/webp':
+            $magicOk = str_starts_with($bytes, 'RIFF') && strlen($bytes) >= 12 && substr($bytes, 8, 4) === 'WEBP';
+            break;
+        case 'application/pdf':
+            $magicOk = str_starts_with($bytes, '%PDF-');
+            break;
+    }
+    if (!$magicOk) {
+        taskFail('File content does not match its declared type', 422);
     }
 
     $visibility = (string)($input['visibility'] ?? 'internal');

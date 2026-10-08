@@ -159,7 +159,7 @@
             ['Completed', cnt('completed'), '#059669'],
         ];
         box.innerHTML = cells.map(([k, v, c]) =>
-            `<div class="pri-stat" style="border-color:${c}33;"><div style="color:${c};font-size:1.3rem;font-weight:900;">${v}</div><div class="tk-muted">${k}</div></div>`
+            `<div class="pri-stat-card" style="border-color:${c}33;"><div style="color:${c};font-size:1.3rem;font-weight:900;">${v}</div><div class="tk-muted">${k}</div></div>`
         ).join('');
     }
 
@@ -346,7 +346,8 @@
             }
             if (c.can_cancel) parts.push(btn('tk-transition', '🗑 Cancel Task', 'btn-del', 'data-to="cancelled"'));
         }
-        if (c.can_edit || c.can_assign) parts.push(btn('tk-edit', '✏ Edit', 'btn-soft'));
+        const closed = t.status === 'completed' || t.status === 'cancelled';
+        if ((c.can_edit || c.can_assign) && !closed) parts.push(btn('tk-edit', '✏ Edit', 'btn-soft'));
 
         if (TK.blockArmed) {
             parts.push(btn('tk-block-confirm', '✔ Confirm Block', 'btn-del', 'data-to="blocked"'));
@@ -702,6 +703,9 @@
                     body: JSON.stringify({ action: 'update', id: t.id, version: t.version, ...common }),
                 });
                 if (!upd.success) { toast(upd.error || 'Update failed', 'err'); return; }
+                if (responsibleId === 0 && (t.assignees || []).length > 0) {
+                    toast('Assignment unchanged — pick a person to reassign (it cannot be cleared here).', 'inf');
+                }
                 if (responsibleId > 0) {
                     const asg = await api('tasks_api.php', {
                         method: 'POST', headers: { 'Content-Type': 'application/json' },

@@ -19,6 +19,7 @@ if (!defined('NAWARA_TASKS_UI_MARKUP')) {
         ?>
 <!-- Nawara Tasks UI (shared markup) -->
 <style>
+    #tkStats { grid-template-columns: repeat(6, 1fr); }
     .tk-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .tk-select, .tk-search {
         border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
@@ -82,6 +83,7 @@ if (!defined('NAWARA_TASKS_UI_MARKUP')) {
     @media (max-width: 768px) {
         .tk-form-grid { grid-template-columns: 1fr; }
         .tk-board { grid-auto-columns: minmax(200px, 86vw); }
+        #tkStats { grid-template-columns: repeat(3, 1fr); }
     }
 </style>
 
