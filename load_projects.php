@@ -87,6 +87,12 @@ try {
             jsonOut(['error' => 'Project not found'], 404);
         }
 
+        // Contract value is commercial data: only project editors (and head
+        // admins) receive it; viewers see null.
+        if (!isHeadAdmin($currentUser) && !canDoOnProjectPermission($id, 'edit')) {
+            $project['contract_value'] = null;
+        }
+
         // اضافه کردن user_access
         $project['user_access'] = getUserAccessForProject($pdo, $id);
 
@@ -143,6 +149,11 @@ try {
         $summary = calculateProjectSummary($pdo, (int)$project['id']);
         $project['progress'] = $summary['overall'];
         $project['section_progress'] = $summary['sections'];
+        // Contract value is commercial data: only project editors (and head
+        // admins) receive it; everyone else sees null in the payload.
+        if (!isHeadAdmin($currentUser) && !canDoOnProjectPermission((int)$project['id'], 'edit')) {
+            $project['contract_value'] = null;
+        }
         $project['overall_status'] = overallStatusFromProgress((int)$summary['overall']);
         $project['user_access'] = getUserAccessForProject($pdo, (int)$project['id']);
     }

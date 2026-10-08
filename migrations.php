@@ -9,7 +9,7 @@
 
 function dbTableHasColumn(PDO $pdo, string $table, string $column): bool
 {
-    $allowedTables = ['pm_users', 'pm_projects', 'pm_audit_log', 'pm_priorities', 'pm_tasks'];
+    $allowedTables = ['pm_users', 'pm_projects', 'pm_audit_log', 'pm_priorities', 'pm_tasks', 'pm_project_values'];
     if (!in_array($table, $allowedTables, true)) {
         throw new InvalidArgumentException('Unsupported migration table');
     }
@@ -936,6 +936,135 @@ function clientCollaborationFoundationMigration(PDO $pdo): void
     ");
 }
 
+function progressForecastMigration(PDO $pdo): void
+{
+    // Per-project progress engine: manual (legacy status picking) vs
+    // task_driven (item percent derived from approved tasks).
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'progress_mode', "TEXT NOT NULL DEFAULT 'manual'");
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'contract_value', 'REAL NOT NULL DEFAULT 0');
+
+    // Exact task-derived percent per item (-1 = no linked progress tasks).
+    dbAddColumnIfMissing($pdo, 'pm_project_values', 'task_percent', 'REAL NOT NULL DEFAULT -1');
+
+    // Daily planned-vs-earned history for the S-curve and EVM forecasts.
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_progress_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            snapshot_date TEXT NOT NULL,
+            planned_pct REAL NOT NULL DEFAULT 0,
+            earned_pct REAL NOT NULL DEFAULT 0,
+            actual_cost REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(project_id, snapshot_date),
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+        )
+    ");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_pm_progress_snapshots_project
+        ON pm_progress_snapshots(project_id, snapshot_date)');
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_pm_tasks_project_item_progress
+        ON pm_tasks(project_id, item_id, affects_project_progress, status)');
+
+    // Existing projects keep the legacy manual behaviour (column default).
+    $pdo->exec("
+        UPDATE pm_projects
+        SET progress_mode = 'manual'
+        WHERE progress_mode NOT IN ('manual', 'task_driven')
+    ");
+}
+
+function stage5FinanceReportsNikMigration(PDO $pdo): void
+{
+    // ---- Finance (admin-only): payments, expenses, withdrawals ----
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_project_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            amount REAL NOT NULL CHECK (amount > 0),
+            paid_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+        )
+    ");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_pm_payments_project
+        ON pm_project_payments(project_id, paid_at)');
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_project_expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            category TEXT NOT NULL DEFAULT '',
+            amount REAL NOT NULL CHECK (amount > 0),
+            spent_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE
+        )
+    ");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_pm_expenses_project
+        ON pm_project_expenses(project_id, spent_at)');
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_withdrawals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL CHECK (amount > 0),
+            taken_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    ");
+
+    // ---- Employee score events (award = progress points raised on approve) ----
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_task_score_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            points REAL NOT NULL DEFAULT 0,
+            progress_before REAL NOT NULL DEFAULT 0,
+            progress_after REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(task_id, user_id),
+            FOREIGN KEY(project_id) REFERENCES pm_projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(task_id) REFERENCES pm_tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY(user_id) REFERENCES pm_users(id) ON DELETE CASCADE
+        )
+    ");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_pm_score_events_user
+        ON pm_task_score_events(user_id)');
+
+    // ---- NiK chatbot: conversation log + memory (owner 0 = global/admin) ----
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS nik_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            intent TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        )
+    ");
+    $pdo->exec('CREATE INDEX IF NOT EXISTS idx_nik_messages_user
+        ON nik_messages(user_id, id)');
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS nik_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_user_id INTEGER NOT NULL DEFAULT 0,
+            memo_key TEXT NOT NULL,
+            memo_value TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(owner_user_id, memo_key)
+        )
+    ");
+}
+
 function getDatabaseMigrations(): array
 {
     return [
@@ -966,6 +1095,8 @@ function getDatabaseMigrations(): array
         '20261008_007_security_design_remediation' => 'securityRemediationMigration',
         '20261008_008_priorities_integrity' => 'prioritiesIntegrityMigration',
         '20261008_009_client_collaboration_foundation' => 'clientCollaborationFoundationMigration',
+        '20261009_010_progress_forecast_engine' => 'progressForecastMigration',
+        '20261009_011_finance_reports_nik' => 'stage5FinanceReportsNikMigration',
     ];
 }
 

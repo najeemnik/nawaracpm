@@ -61,3 +61,6 @@ desktop.ini
 *.temp
 *.bak
 *.orig
+
+# ---------- harness/preview (tooling, never committed) ----------
+/harness/

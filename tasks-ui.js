@@ -81,8 +81,42 @@
     const TK = {
         projects: [], projectId: 'all', status: '', q: '', view: 'list',
         tasks: [], detail: null, editing: null, assignable: [],
-        blockArmed: false, ready: false,
+        blockArmed: false, ready: false, meta: null,
     };
+
+    async function ensureMeta() {
+        if (TK.meta) return TK.meta;
+        try {
+            const d = await api('load_projects.php?meta=1');
+            if (d.success && d.meta) TK.meta = d.meta;
+        } catch (e) { /* graceful */ }
+        return TK.meta;
+    }
+
+    function fillSectionSelect(selected) {
+        const sel = $('tkFSection');
+        if (!sel) return;
+        const sections = (TK.meta && TK.meta.sections) || [];
+        sel.innerHTML = '<option value="">— none —</option>'
+            + sections.map((sec) => `<option value="${sec.id}">${esc(sec.icon || '')} ${esc(sec.name)}</option>`).join('');
+        sel.value = selected ? String(selected) : '';
+        fillItemSelect(sel.value, null);
+    }
+
+    function fillItemSelect(sectionId, selectedItem) {
+        const sel = $('tkFItem');
+        if (!sel) return;
+        const sections = (TK.meta && TK.meta.sections) || [];
+        const section = sections.find((sec) => String(sec.id) === String(sectionId));
+        const items = section ? (section.items || []) : [];
+        sel.innerHTML = '<option value="">— none —</option>'
+            + items.map((it) => `<option value="${it.id}">${esc(it.name)} (${esc(it.weight)}%)</option>`).join('');
+        sel.disabled = items.length === 0;
+        if (selectedItem) {
+            const has = [...sel.options].some((o) => o.value === String(selectedItem));
+            if (has) sel.value = String(selectedItem);
+        }
+    }
 
     const isEmployeeSurface = () => document.body && document.body.dataset.role === 'employee';
 
@@ -160,7 +194,23 @@
         ];
         box.innerHTML = cells.map(([k, v, c]) =>
             `<div class="pri-stat-card" style="border-color:${c}33;"><div style="color:${c};font-size:1.3rem;font-weight:900;">${v}</div><div class="tk-muted">${k}</div></div>`
-        ).join('');
+        ).join('')
+            // Bare score card: number only, no label (stage-5 scope).
+            + `<div class="pri-stat-card tk-score-card" title="score"><div style="font-size:1.3rem;font-weight:900;color:#0f172a;" id="tkMyScore">…</div></div>`;
+        loadMyScore();
+    }
+
+    let myScoreLoaded = false;
+    async function loadMyScore() {
+        if (myScoreLoaded) return;
+        myScoreLoaded = true;
+        try {
+            const d = await api('employee_api.php?action=my_score');
+            const el = $('tkMyScore');
+            if (el && d && typeof d.score === 'number') {
+                el.textContent = String(d.score);
+            }
+        } catch (e) { /* silent: bare card stays … */ }
     }
 
     function taskRowHTML(t, idx) {
@@ -598,7 +648,7 @@
     }
 
     async function openForm(task = null) {
-        await ensureProjects();
+        await Promise.all([ensureProjects(), ensureMeta()]);
         TK.editing = task;
         $('tkFormTitle').textContent = task ? 'Edit Task' : 'New Task';
         $('tkFormSub').textContent = task ? ('#' + task.id + ' — update fields and assignment') : 'Define the work, who does it, and the review rules';
@@ -619,6 +669,8 @@
             $('tkFMode').value = t.assignment_mode;
             $('tkFStart').value = t.start_at || '';
             $('tkFDue').value = t.due_at || '';
+            fillSectionSelect(t.section_id || '');
+            fillItemSelect(t.section_id || '', t.item_id || null);
             $('tkFReview').checked = !!Number(t.review_required);
             $('tkFReqComment').checked = !!Number(t.require_comment_on_submit);
             $('tkFReqFile').checked = !!Number(t.require_file_on_submit);
@@ -654,6 +706,7 @@
             $('tkFClientApproval').checked = false;
             $('tkFClientComments').checked = false;
             $('tkFClientFiles').checked = false;
+            fillSectionSelect('');
             const first = TK.projects[0];
             projSel.value = first ? String(first.id) : '';
             await loadAssignable(first ? first.id : 0);
@@ -671,11 +724,15 @@
         const responsibleId = Number($('tkFAssignee').value) || 0;
         const contributorIds = mode === 'single' ? [] : selectedIds($('tkFContributors'));
         const reviewerIds = selectedIds($('tkFReviewers'));
+        const sectionVal = ($('tkFSection') || {}).value || '';
+        const itemVal = ($('tkFItem') || {}).value || '';
         const common = {
             title,
             description: $('tkFDesc').value.trim(),
             priority: $('tkFPriority').value,
             assignment_mode: mode,
+            section_id: sectionVal === '' ? null : Number(sectionVal),
+            item_id: itemVal === '' ? null : Number(itemVal),
             start_at: $('tkFStart').value || '',
             due_at: $('tkFDue').value || '',
             review_required: $('tkFReview').checked ? 1 : 0,
@@ -813,6 +870,7 @@
         if (el.dataset.action === 'tk-filter-project') { TK.projectId = el.value; await loadTasks(); return; }
         if (el.dataset.action === 'tk-filter-status') { TK.status = el.value; renderList(); return; }
         if (el.id === 'tkFProject') { await loadAssignable(Number(el.value)); return; }
+        if (el.id === 'tkFSection') { fillItemSelect(el.value, null); return; }
         if (el.id === 'tkFMode') { syncFormMode(); return; }
         if (el.id === 'tkFProgress' || el.id === 'tkFClientApproval' || el.id === 'tkFClientVisible') { syncFormMode(); return; }
         if (el.dataset.action === 'tk-chk-toggle') { checklistToggle(Number(el.dataset.item)); return; }

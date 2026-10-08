@@ -19,7 +19,7 @@ if (!defined('NAWARA_TASKS_UI_MARKUP')) {
         ?>
 <!-- Nawara Tasks UI (shared markup) -->
 <style>
-    #tkStats { grid-template-columns: repeat(6, 1fr); }
+    #tkStats { grid-template-columns: repeat(7, 1fr); }
     .tk-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
     .tk-select, .tk-search {
         border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px;
@@ -179,6 +179,14 @@ if (!defined('NAWARA_TASKS_UI_MARKUP')) {
                     <select id="tkFReviewers" multiple></select>
                 </div>
                 <div class="fg">
+                    <label>Section (links progress)</label>
+                    <select id="tkFSection"><option value="">— none —</option></select>
+                </div>
+                <div class="fg">
+                    <label>Item (links progress)</label>
+                    <select id="tkFItem" disabled><option value="">— none —</option></select>
+                </div>
+                <div class="fg">
                     <label>Start Date</label>
                     <input type="date" id="tkFStart">
                 </div>
@@ -269,6 +277,24 @@ if (!defined('NAWARA_TASKS_UI_MARKUP')) {
             <button class="btn btn-secondary" type="button" data-action="tk-detail-close">Close</button>
         </div>
     </div>
+</div>
+
+<!-- NiK assistant widget (shared: CPM + Tasks) -->
+<button type="button" class="nik-fab" id="nikFab" title="NiK — دستیار هوشمند">🤖</button>
+<div class="nik-panel" id="nikPanel" aria-hidden="true">
+    <div class="nik-head">
+        <span class="nik-title">🤖 نیک — NiK</span>
+        <span class="nik-actions">
+            <button type="button" class="nik-mini" id="nikSpeakBtn" title="بلند خواندن آخرین جواب">🔊</button>
+            <button type="button" class="nik-mini" id="nikCloseBtn" title="بستن">✕</button>
+        </span>
+    </div>
+    <div class="nik-messages" id="nikMessages"></div>
+    <div class="nik-suggest" id="nikSuggest"></div>
+    <form class="nik-input" id="nikForm">
+        <input type="text" id="nikText" autocomplete="off" placeholder="از نیک بپرس... مثلاً: پیشرفت کابل پلازا چقدره؟">
+        <button type="submit" class="btn btn-primary btn-sm">➤</button>
+    </form>
 </div>
         <?php
     }

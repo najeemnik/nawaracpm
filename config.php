@@ -173,6 +173,18 @@ define('NAWARA_SESSION_ABSOLUTE_TIMEOUT', max(
 
 if (session_status() === PHP_SESSION_NONE) {
     $sessionLifetime = max(900, (int)(getenv('NAWARA_SESSION_LIFETIME') ?: 86400));
+    // Preview/sandbox runtime: the configured session directory may not exist
+    // (php-wasm defaults to /home/web_user). Non-production only — hosts keep
+    // their own valid save_path untouched.
+    if (APP_ENV !== 'production') {
+        $savePath = (string)ini_get('session.save_path');
+        if ($savePath !== '' && (!is_dir($savePath) || !is_writable($savePath))) {
+            $tmp = sys_get_temp_dir();
+            if (is_dir($tmp) && is_writable($tmp)) {
+                ini_set('session.save_path', $tmp);
+            }
+        }
+    }
     ini_set('session.use_strict_mode', '1');
     ini_set('session.use_only_cookies', '1');
     ini_set('session.cookie_httponly', '1');

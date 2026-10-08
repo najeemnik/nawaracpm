@@ -924,6 +924,9 @@ if ($action === 'create') {
             'review_required' => $reviewRequired,
         ]));
 
+        // Progress side-effects commit atomically with the task itself.
+        syncTaskProgress($pdo, $projectId, $itemId);
+
         $pdo->commit();
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
@@ -1068,6 +1071,9 @@ if ($action === 'update') {
                 WHERE task_id = ?
             ")->execute([$resetTo, $taskId]);
         }
+
+        syncTaskProgress($pdo, $projectId, $itemId,
+            isset($task['item_id']) && $task['item_id'] !== null ? (int)$task['item_id'] : null);
 
         $fresh = loadTaskOrFail($pdo, $taskId);
         taskActivity($pdo, $fresh, 'task_updated', $actorId,
@@ -1525,6 +1531,17 @@ if ($action === 'transition') {
             ")->execute([$taskId]);
         }
 
+        // Completion and cancellation change the item's task-derived percent.
+        // On completion, award progress points to the people who did the work.
+        if ($to === 'completed' || $to === 'cancelled') {
+            $progressBefore = (int)calculateProjectSummary($pdo, $pid)['overall'];
+            syncTaskProgress($pdo, $pid,
+                isset($task['item_id']) && $task['item_id'] !== null ? (int)$task['item_id'] : null);
+            if ($to === 'completed') {
+                awardTaskProgressScore($pdo, $pid, $taskId, $progressBefore);
+            }
+        }
+
         // On approve-with-client: create recipient rows for project clients.
         if ($to === 'awaiting_client_approval') {
             $insertRecipient = $pdo->prepare("
@@ -1947,6 +1964,11 @@ if ($action === 'client_decision') {
                 WHERE task_id = ?
             ")->execute([$taskId]);
             $to = 'completed';
+            $clientApprovalPid = (int)$task['project_id'];
+            $clientApprovalBefore = (int)calculateProjectSummary($pdo, $clientApprovalPid)['overall'];
+            syncTaskProgress($pdo, $clientApprovalPid,
+                isset($task['item_id']) && $task['item_id'] !== null ? (int)$task['item_id'] : null);
+            awardTaskProgressScore($pdo, $clientApprovalPid, $taskId, $clientApprovalBefore);
         } else {
             $pdo->prepare("
                 UPDATE pm_tasks

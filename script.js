@@ -420,8 +420,10 @@ function updateLiveSectionProgress() {
 async function openProjectForm() {
     await loadMeta();
     CURRENT_PROJECT = null;
-    const fields = ['projectId','projectName','clientName','zone','startDate','endDate','description'];
+    const fields = ['projectId','projectName','clientName','zone','startDate','endDate','description','contractValue'];
     fields.forEach(id => { const el = $(id); if (el) el.value = id === 'projectId' ? '0' : ''; });
+    const modeSel = $('progressMode');
+    if (modeSel) modeSel.value = 'task_driven'; // approved default for new projects
     const lead = $('leadEngineer');
     if (lead) lead.innerHTML = engineerOptions('');
     buildSectionsForm(null);
@@ -443,6 +445,11 @@ async function editProject(id) {
     $('startDate').value = CURRENT_PROJECT.start_date || '';
     $('endDate').value = CURRENT_PROJECT.end_date || '';
     $('description').value = CURRENT_PROJECT.description || '';
+    const modeField = $('progressMode');
+    if (modeField) modeField.value = CURRENT_PROJECT.progress_mode === 'task_driven' ? 'task_driven' : 'manual';
+    const cvField = $('contractValue');
+    if (cvField) cvField.value = (CURRENT_PROJECT.contract_value || CURRENT_PROJECT.contract_value === 0)
+        ? Number(CURRENT_PROJECT.contract_value) : '';
     $('leadEngineer').innerHTML = engineerOptions(CURRENT_PROJECT.lead_engineer_id || '');
 
     buildSectionsForm(CURRENT_PROJECT);
@@ -494,7 +501,9 @@ async function saveProject() {
             lead_engineer_id: $('leadEngineer').value && !String($('leadEngineer').value).startsWith('__') ? $('leadEngineer').value : '',
             start_date: $('startDate').value,
             end_date: $('endDate').value,
-            description: $('description').value.trim()
+            description: $('description').value.trim(),
+            progress_mode: ($('progressMode') || {}).value || undefined,
+            contract_value: ($('contractValue') || {}).value || ''
         },
         values: collectProjectValues()
     };
@@ -576,8 +585,12 @@ async function openDetail(id) {
 
     const t = $('detailTitle');
     if (t) t.textContent = '📋 ' + p.project_name;
+    const forecastHtml = `
+        <div class="dsec">🎯 Forecast &amp; Earned Value</div>
+        <div id="detailEvm" class="tk-muted">Loading forecast…</div>`;
     const body = $('detailBody');
-    if (body) body.innerHTML = info + secProgress + sectionsHtml;
+    if (body) body.innerHTML = info + secProgress + forecastHtml + sectionsHtml;
+    loadEvmCard(parseInt(p.id, 10) || 0);
 
     // دکمه Edit بر اساس permission
     const editBtn = $('detailEditBtn');
@@ -594,6 +607,74 @@ async function openDetail(id) {
     }
 
     openOverlay('detailModal');
+}
+
+function evmChartSvg(series, planAvailable) {
+    if (!Array.isArray(series) || series.length < 2) {
+        return '<div class="tk-muted" style="margin-top:8px;">The S-curve grows as daily snapshots accumulate.</div>';
+    }
+    const W = 560, H = 170, pad = 28;
+    const n = series.length;
+    const x = (i) => pad + (n < 2 ? 0 : (i / (n - 1)) * (W - 2 * pad));
+    const y = (v) => H - pad - (Math.max(0, Math.min(100, Number(v) || 0)) / 100) * (H - 2 * pad);
+    const path = (key) => series.map((pt, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(pt[key]).toFixed(1)}`).join(' ');
+    const grid = [0, 25, 50, 75, 100].map(v =>
+        `<line x1="${pad}" y1="${y(v)}" x2="${W - pad}" y2="${y(v)}" stroke="#e2e8f0" stroke-width="1"/>
+         <text x="4" y="${y(v) + 4}" font-size="9" fill="#94a3b8">${v}</text>`).join('');
+    const planned = planAvailable
+        ? `<path d="${path('planned')}" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="5 4"/>`
+        : '';
+    const earnedDots = series.map((pt, i) =>
+        `<circle cx="${x(i).toFixed(1)}" cy="${y(pt.earned).toFixed(1)}" r="2.5" fill="#2563eb"/>`).join('');
+    return `
+        <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;background:#fff;border:1px solid #e2e8f0;border-radius:12px;margin-top:8px;" role="img" aria-label="Planned versus earned progress">
+            ${grid}
+            ${planned}
+            <path d="${path('earned')}" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+            ${earnedDots}
+        </svg>
+        <div style="display:flex;gap:14px;font-size:.75rem;color:#64748b;margin-top:4px;">
+            <span>— <span style="color:#2563eb;font-weight:800;">Earned (actual)</span></span>
+            ${planAvailable ? '<span>┄ <span style="color:#94a3b8;font-weight:800;">Planned (S-curve)</span></span>' : ''}
+        </div>`;
+}
+
+async function loadEvmCard(projectId) {
+    const box = $('detailEvm');
+    if (!box || !projectId) return;
+    try {
+        const d = await api('progress_api.php?action=evm&project_id=' + projectId);
+        if (!d.success) {
+            box.innerHTML = `<span class="tk-muted">${esc(d.error || 'Forecast unavailable')}</span>`;
+            return;
+        }
+        const e = d.evm;
+        const cell = (k, v, color) => `
+            <div class="tk-meta-cell" style="min-width:130px;">
+                <div class="k">${k}</div>
+                <div class="v" style="${color ? 'color:' + color + ';' : ''}">${v}</div>
+            </div>`;
+        const spiTxt = e.spi === null ? '—' : Number(e.spi).toFixed(2);
+        const spiColor = e.spi === null ? '' : (e.spi >= 0.95 ? '#059669' : (e.spi >= 0.85 ? '#d97706' : '#dc2626'));
+        const money = (v) => v === null ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: 0 });
+        const slip = e.day_slippage === null ? '—'
+            : (e.day_slippage === 0 ? 'on time' : (e.day_slippage > 0 ? '+' + e.day_slippage + ' d late' : e.day_slippage + ' d early'));
+        box.innerHTML = `
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+                ${cell('Earned %', Number(e.earned_pct).toFixed(1) + '%', '#2563eb')}
+                ${cell('Planned %', e.planned_pct === null ? 'no plan dates' : Number(e.planned_pct).toFixed(1) + '%')}
+                ${cell('SPI', spiTxt, spiColor)}
+                ${e.bac !== null ? cell('EV / PV', money(e.ev) + ' / ' + money(e.pv)) : ''}
+                ${e.cpi !== null ? cell('CPI / EAC', Number(e.cpi).toFixed(2) + ' / ' + money(e.eac)) : ''}
+                ${cell('Forecast finish', e.forecast_end || '—', (e.day_slippage || 0) > 0 ? '#dc2626' : '#059669')}
+                ${cell('Schedule slip', slip, (e.day_slippage || 0) > 0 ? '#dc2626' : '#059669')}
+            </div>
+            ${e.late_phase ? '<div class="tk-muted" style="color:#d97706;font-weight:700;">⚠ Late phase (≥70% complete): SPI loses meaning here — trust the day-slippage above.</div>' : ''}
+            ${e.bac === null ? '<div class="tk-muted">Contract value not set yet — money metrics (EV/PV/CPI/EAC) appear once it is entered.</div>' : ''}
+            ${evmChartSvg(d.series, !!e.plan_available)}`;
+    } catch (err) {
+        box.innerHTML = '<span class="tk-muted">Forecast unavailable</span>';
+    }
 }
 
 function closeDetail() { closeOverlay('detailModal'); }
@@ -1271,7 +1352,7 @@ async function fmDelete(path, name, isFolder) {
 // CSP-SAFE EVENT DELEGATION
 // ============================================
 const NAWARA_OVERLAYS = new Set([
-    'updateModal', 'settingsModal', 'tasksModal', 'taskFormPanel', 'taskDetailPanel', 'usersModal', 'userFormModal', 'filesModal', 'detailModal', 'projectModal', 'archivedProjectsModal'
+    'updateModal', 'settingsModal', 'tasksModal', 'taskFormPanel', 'taskDetailPanel', 'usersModal', 'userFormModal', 'filesModal', 'detailModal', 'projectModal', 'archivedProjectsModal', 'reportsModal', 'employeesModal'
 ]);
 const NAWARA_REMOVE_SELECTORS = new Set([
     '.status-setting-row', '.settings-section-card', '.settings-item-row'

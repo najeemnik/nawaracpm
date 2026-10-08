@@ -523,9 +523,26 @@ try {
             jsonOut(['error' => 'Project dates are invalid'], 422);
         }
 
+        $progressMode = null;
+        if (array_key_exists('progress_mode', $project) && $project['progress_mode'] !== null && $project['progress_mode'] !== '') {
+            if (!in_array($project['progress_mode'], ['manual', 'task_driven'], true)) {
+                jsonOut(['error' => 'Invalid progress mode'], 422);
+            }
+            $progressMode = (string)$project['progress_mode'];
+        }
+        $contractValue = null;
+        if (array_key_exists('contract_value', $project) && $project['contract_value'] !== null && $project['contract_value'] !== '') {
+            $contractValue = filter_var($project['contract_value'], FILTER_VALIDATE_FLOAT);
+            if ($contractValue === false || $contractValue < 0 || $contractValue > 1e12) {
+                jsonOut(['error' => 'Contract value must be a non-negative number'], 422);
+            }
+            $contractValue = (float)$contractValue;
+        }
+
         $id = (int)($project['id'] ?? 0);
         $isNewProject = $id === 0;
         $expectedVersion = (int)($project['version'] ?? 0);
+        $previousMode = $isNewProject ? null : projectProgressMode($pdo, $id);
         $leadEngineerId = !empty($project['lead_engineer_id']) ? (int)$project['lead_engineer_id'] : null;
         if (count($values) > 500) {
             jsonOut(['error' => 'Too many project values'], 422);
@@ -554,6 +571,16 @@ try {
 
         if ($id > 0) {
             $currentActor = getCurrentUser();
+            $extraSet = '';
+            $extraParams = [];
+            if ($progressMode !== null) {
+                $extraSet .= ', progress_mode = :progress_mode';
+                $extraParams['progress_mode'] = $progressMode;
+            }
+            if ($contractValue !== null) {
+                $extraSet .= ', contract_value = :contract_value';
+                $extraParams['contract_value'] = $contractValue;
+            }
             $stmt = $pdo->prepare("
                 UPDATE pm_projects
                 SET project_name = :project_name,
@@ -562,13 +589,13 @@ try {
                     lead_engineer_id = :lead_engineer_id,
                     start_date = :start_date,
                     end_date = :end_date,
-                    description = :description,
+                    description = :description" . $extraSet . ",
                     updated_by = :updated_by,
                     version = version + 1,
                     updated_at = datetime('now','localtime')
                 WHERE id = :id AND version = :expected_version AND deleted_at = ''
             ");
-            $stmt->execute([
+            $stmt->execute(array_merge([
                 'project_name' => $projectName,
                 'client_name' => $clientName,
                 'zone' => $zone,
@@ -579,7 +606,7 @@ try {
                 'updated_by' => (int)($currentActor['id'] ?? 0) ?: null,
                 'id' => $id,
                 'expected_version' => $expectedVersion
-            ]);
+            ], $extraParams));
             if ($stmt->rowCount() !== 1) {
                 throw new RuntimeException('Project version conflict');
             }
@@ -588,11 +615,11 @@ try {
             $stmt = $pdo->prepare("
                 INSERT INTO pm_projects(
                     project_name, client_name, zone, lead_engineer_id, start_date, end_date,
-                    description, owner_user_id, updated_by, version
+                    description, progress_mode, contract_value, owner_user_id, updated_by, version
                 )
                 VALUES(
                     :project_name, :client_name, :zone, :lead_engineer_id, :start_date, :end_date,
-                    :description, :owner_user_id, :updated_by, 1
+                    :description, :progress_mode, :contract_value, :owner_user_id, :updated_by, 1
                 )
             ");
             $stmt->execute([
@@ -603,6 +630,9 @@ try {
                 'start_date' => $startDate,
                 'end_date' => $endDate,
                 'description' => $description,
+                // Approved default: new projects are task-driven.
+                'progress_mode' => $progressMode ?? 'task_driven',
+                'contract_value' => $contractValue ?? 0.0,
                 'owner_user_id' => (int)($creator['id'] ?? 0) ?: null,
                 'updated_by' => (int)($creator['id'] ?? 0) ?: null,
             ]);
@@ -740,6 +770,11 @@ try {
             }
         }
 
+        if (($progressMode ?? $previousMode) === 'task_driven' && $previousMode !== 'task_driven') {
+            // Switching a project to task-driven: compute item percents from
+            // any progress tasks that already exist.
+            syncAllTaskDrivenItems($pdo, $id);
+        }
         $progress = updateProjectProgress($pdo, $id);
         $pdo->commit();
         $newVersion = $isNewProject ? 1 : $expectedVersion + 1;

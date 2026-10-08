@@ -223,5 +223,6 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
 
 <?php require_once __DIR__ . '/tasks_ui_markup.php'; tasks_ui_markup(); ?>
 <script src="tasks-ui.js?v=<?php echo app_asset_version('tasks-ui.js'); ?>"></script>
+<script src="nik-ui.js?v=<?php echo app_asset_version('nik-ui.js'); ?>"></script>
 </body>
 </html>

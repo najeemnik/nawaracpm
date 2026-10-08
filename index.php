@@ -265,6 +265,12 @@ function hasPerm($perm) {
             <button class="btn btn-soft" data-action="open-archived-projects" title="Restore archived projects">
                 <span>🗄</span> Archive
             </button>
+            <button class="btn btn-soft" data-action="open-reports" title="Reports">
+                <span>📊</span> Reports
+            </button>
+            <button class="btn btn-soft" data-action="open-employees" title="Employee statistics">
+                <span>🏆</span> Employees
+            </button>
             <?php endif; ?>
 
             <button class="btn btn-secondary" data-action="refresh-projects">
@@ -418,6 +424,15 @@ function hasPerm($perm) {
                         <div class="fg"><label>Lead Engineer</label><select id="leadEngineer"></select></div>
                         <div class="fg"><label>Start Date</label><input type="date" id="startDate"></div>
                         <div class="fg"><label>End Date</label><input type="date" id="endDate"></div>
+                        <div class="fg"><label>Progress Engine</label>
+                            <select id="progressMode">
+                                <option value="task_driven">Task-driven (automatic)</option>
+                                <option value="manual">Manual (status-based)</option>
+                            </select>
+                        </div>
+                        <div class="fg"><label>Contract Value <small style="color:#94a3b8;">(optional — enter later)</small></label>
+                            <input type="number" id="contractValue" min="0" step="0.01" placeholder="0 = not set">
+                        </div>
                         <div class="fg full"><label>Description</label><textarea id="description" rows="3"></textarea></div>
                     </div>
                 </div>
@@ -485,6 +500,50 @@ function hasPerm($perm) {
         <div class="modal-foot">
             <button class="btn btn-secondary" data-action="close-detail">Close</button>
             <button class="btn btn-primary" id="detailEditBtn">✏️ Edit</button>
+        </div>
+    </div>
+</div>
+
+<!-- Reports Modal (admin) -->
+<div class="overlay" id="reportsModal">
+    <div class="modal modal-xl">
+        <div class="modal-head">
+            <h2>📊 Reports — راپورها</h2>
+            <button class="modal-x" data-action="close-overlay" data-overlay="reportsModal">✕</button>
+        </div>
+        <div class="modal-body">
+            <div class="rep-toolbar">
+                <div class="fg"><label>From</label><input type="date" id="repFrom"></div>
+                <div class="fg"><label>To</label><input type="date" id="repTo"></div>
+                <div class="fg"><label>Project</label><select id="repProject"><option value="0">All projects</option></select></div>
+                <button class="btn btn-primary" data-action="rep-generate">🔎 Generate</button>
+                <button class="btn btn-secondary" data-action="rep-print">🖨 Print</button>
+            </div>
+            <div id="repBody" class="rep-body"><div class="tk-muted">Pick a range and press Generate.</div></div>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="reportsModal">Close</button>
+        </div>
+    </div>
+</div>
+
+<!-- Employees Statistics Modal (admin) -->
+<div class="overlay" id="employeesModal">
+    <div class="modal modal-xl">
+        <div class="modal-head">
+            <h2>🏆 Employees — آمار کارمندان</h2>
+            <button class="modal-x" data-action="close-overlay" data-overlay="employeesModal">✕</button>
+        </div>
+        <div class="modal-body">
+            <div class="emp-tabs">
+                <button class="tab-btn active" data-action="emp-tab" data-tab="people">👥 People</button>
+                <button class="tab-btn" data-action="emp-tab" data-tab="progress">📈 Project Progress</button>
+            </div>
+            <div id="empPeople" class="emp-panel"></div>
+            <div id="empProgress" class="emp-panel" style="display:none;"></div>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="employeesModal">Close</button>
         </div>
     </div>
 </div>
@@ -661,6 +720,8 @@ function hasPerm($perm) {
 <div id="loadingBox"><div class="spin-wrap"><div class="spin"></div><p>Loading...</p></div></div>
 
 <script src="tasks-ui.js?v=<?php echo app_asset_version('tasks-ui.js'); ?>"></script>
+<script src="extras-ui.js?v=<?php echo app_asset_version('extras-ui.js'); ?>"></script>
+<script src="nik-ui.js?v=<?php echo app_asset_version('nik-ui.js'); ?>"></script>
 <script src="script.js?v=<?php echo app_asset_version('script.js'); ?>"></script>
 </body>
 </html>

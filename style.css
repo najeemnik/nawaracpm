@@ -2007,3 +2007,87 @@ body::after {
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
 }
+/* ================= NiK assistant widget (stage 5) ================= */
+.nik-fab {
+    position: fixed; right: 22px; bottom: 22px; z-index: 9600;
+    width: 54px; height: 54px; border-radius: 50%; border: 0; cursor: pointer;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff;
+    font-size: 1.5rem; box-shadow: 0 10px 26px rgba(99, 102, 241, .45);
+    transition: transform .15s;
+}
+.nik-fab:hover { transform: scale(1.07); }
+.nik-panel {
+    position: fixed; right: 22px; bottom: 88px; z-index: 9601;
+    width: min(380px, calc(100vw - 32px)); height: min(540px, calc(100vh - 130px));
+    background: var(--panel, #fff); border: 1px solid var(--border, #e2e8f0); border-radius: 16px;
+    box-shadow: 0 24px 70px rgba(15, 23, 42, .35); display: none; flex-direction: column; overflow: hidden;
+}
+.nik-panel.nik-open { display: flex; }
+.nik-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: #fff;
+}
+.nik-title { font-weight: 800; font-size: .95rem; }
+.nik-actions { display: flex; gap: 6px; }
+.nik-mini {
+    background: rgba(255, 255, 255, .18); border: 0; color: #fff; border-radius: 8px;
+    width: 30px; height: 30px; cursor: pointer; font-size: 1rem;
+}
+.nik-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; background: var(--bg, #f8fafc); }
+.nik-msg { max-width: 85%; padding: 9px 12px; border-radius: 14px; font-size: .87rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.nik-user { align-self: flex-end; background: #6366f1; color: #fff; border-bottom-right-radius: 4px; }
+.nik-bot { align-self: flex-start; background: var(--panel, #fff); border: 1px solid var(--border, #e2e8f0); border-bottom-left-radius: 4px; }
+.nik-thinking { opacity: .6; }
+.nik-suggest { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 10px 0; }
+.nik-chip {
+    border: 1px solid var(--border, #e2e8f0); background: var(--panel, #fff); color: var(--text, #0f172a);
+    border-radius: 999px; padding: 4px 10px; font-size: .74rem; cursor: pointer;
+}
+.nik-chip:hover { border-color: #6366f1; color: #6366f1; }
+.nik-input { display: flex; gap: 8px; padding: 10px; border-top: 1px solid var(--border, #e2e8f0); }
+.nik-input input {
+    flex: 1; border: 1px solid var(--border, #e2e8f0); border-radius: 10px; padding: 9px 12px;
+    font-size: .87rem; background: var(--bg, #f8fafc); color: var(--text, #0f172a);
+}
+
+/* ================= Reports modal (stage 5) ================= */
+.modal.modal-xl { width: min(1100px, calc(100vw - 32px)); }
+.rep-toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-bottom: 12px; }
+.rep-toolbar .fg { display: flex; flex-direction: column; gap: 4px; font-size: .78rem; color: var(--muted, #64748b); }
+.rep-toolbar input[type="date"], .rep-toolbar select {
+    border: 1px solid var(--border, #e2e8f0); border-radius: 8px; padding: 7px 9px; background: var(--bg, #f8fafc); color: var(--text, #0f172a);
+}
+.rep-body { max-height: 62vh; overflow-y: auto; font-size: .87rem; }
+.rep-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+.rep-card { border: 1px solid; border-radius: 10px; padding: 10px; background: var(--bg, #f8fafc); }
+.rep-card-v { font-size: 1.15rem; font-weight: 900; }
+.rep-card-k { font-size: .72rem; color: var(--muted, #64748b); }
+.rep-body h4 { margin: 16px 0 8px; font-size: .95rem; }
+.rep-sub { font-weight: 700; margin: 10px 0 6px; font-size: .84rem; color: var(--muted, #64748b); }
+.rep-table { width: 100%; border-collapse: collapse; font-size: .8rem; margin-bottom: 8px; }
+.rep-table th { text-align: left; background: var(--bg, #f8fafc); border-bottom: 2px solid var(--border, #e2e8f0); padding: 7px 8px; color: var(--muted, #64748b); }
+.rep-table td { border-bottom: 1px solid var(--border, #e2e8f0); padding: 6px 8px; vertical-align: top; }
+.rep-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.rep-chip { background: var(--bg, #f8fafc); border: 1px solid var(--border, #e2e8f0); border-radius: 999px; padding: 3px 10px; font-size: .76rem; }
+.rep-bar { position: relative; background: var(--bg, #f8fafc); border-radius: 6px; height: 18px; min-width: 120px; overflow: hidden; }
+.rep-bar > div { position: absolute; inset: 0 auto 0 0; background: #6366f1; }
+.rep-bar span { position: absolute; inset: 0; text-align: center; font-size: .7rem; line-height: 18px; color: var(--text, #0f172a); }
+.rep-title { margin: 0 0 10px; font-size: 1.05rem; }
+.rep-title small { color: var(--muted, #64748b); font-weight: 400; }
+@media print {
+    body * { visibility: hidden !important; }
+    .rep-print-area, .rep-print-area * { visibility: visible !important; }
+    .rep-print-area { position: absolute; left: 0; top: 0; width: 100%; max-height: none !important; overflow: visible !important; }
+    .rep-print-area table { font-size: 11px; }
+    .nik-fab, .nik-panel { display: none !important; }
+}
+
+/* ================= Employees modal (stage 5) ================= */
+.emp-tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+.tab-btn {
+    border: 1px solid var(--border, #e2e8f0); background: var(--bg, #f8fafc); color: var(--text, #0f172a);
+    padding: 7px 14px; border-radius: 999px; cursor: pointer; font-size: .84rem;
+}
+.tab-btn.active { background: #6366f1; color: #fff; border-color: #6366f1; }
+.emp-panel { max-height: 62vh; overflow-y: auto; }
+.tk-score-card { display: flex; align-items: center; justify-content: center; border-color: #0f172a33; }
