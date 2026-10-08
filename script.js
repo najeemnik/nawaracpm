@@ -1,18 +1,29 @@
 'use strict';
 
 // ============================================
-// SAFE DEFAULTS
+// SAFE BOOTSTRAP (no inline script required by CSP)
 // ============================================
-if (typeof window.CURRENT_USER === 'undefined' || !window.CURRENT_USER) {
-    window.CURRENT_USER = {
-        name: 'Admin',
-        role: 'admin',
-        permissions: {}
-    };
+function readBootstrapJson(name, fallback) {
+    const meta = document.querySelector(`meta[name="${name}"]`);
+    if (!meta || !meta.content) return fallback;
+    try {
+        const parsed = JSON.parse(meta.content);
+        return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch (_) {
+        return fallback;
+    }
 }
-if (!window.CURRENT_USER.permissions) {
+
+window.CURRENT_USER = readBootstrapJson('nawara-current-user', {
+    name: 'Unknown',
+    role: 'user',
+    permissions: {}
+});
+if (!window.CURRENT_USER.permissions || typeof window.CURRENT_USER.permissions !== 'object') {
     window.CURRENT_USER.permissions = {};
 }
+const csrfMeta = document.querySelector('meta[name="nawara-csrf-token"]');
+window.NAWARA_CSRF_TOKEN = csrfMeta ? csrfMeta.content : '';
 
 // ============================================
 // HELPERS
@@ -25,11 +36,17 @@ let CURRENT_PROJECT = null;
 let ALL_USERS = [];
 let USER_PROJECT_ACCESS_LOADED = false;
 
-const esc = s => {
-    const d = document.createElement('div');
-    d.textContent = s ?? '';
-    return d.innerHTML;
-};
+// Safe for both HTML text and quoted HTML attribute contexts. Do not use the
+// browser's text-node serializer here: it may leave quotes unescaped because
+// they are harmless in a text node but dangerous when interpolated into an
+// attribute in an HTML template string.
+const esc = s => String(s ?? '').replace(/[&<>"']/g, char => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+}[char]));
 
 const nowLocalInput = () => {
     const d = new Date();
@@ -65,7 +82,7 @@ function toast(msg, type = 'inf') {
     el.innerHTML = `
         <span>${icons[type] || icons.inf}</span>
         <span class="toast-msg">${esc(msg)}</span>
-        <button class="toast-cls" onclick="this.parentElement.remove()">✕</button>
+        <button class="toast-cls" type="button" data-action="toast-close">✕</button>
     `;
     const box = $('toastBox');
     if (box) box.appendChild(el);
@@ -188,8 +205,9 @@ function renderProjects() {
 
     tbody.innerHTML = PROJECTS.map((p, i) => {
         const progress = parseInt(p.progress) || 0;
-        const safeName = String(p.project_name || '').replace(/'/g, "\\'");
-        
+        const projectId = parseInt(p.id, 10) || 0;
+        const projectVersion = parseInt(p.version, 10) || 0;
+
         // چک دسترسی
         const access = p.user_access || {};
         const canEdit = isAdmin || access.edit;
@@ -201,7 +219,7 @@ function renderProjects() {
         return `
             <tr>
                 <td>${i + 1}</td>
-                <td><span class="pname" onclick="openDetail(${p.id})">${esc(p.project_name)}</span></td>
+                <td><button type="button" class="pname" data-action="open-detail" data-project-id="${projectId}">${esc(p.project_name)}</button></td>
                 <td>${esc(p.client_name)}</td>
                 <td class="hide-sm">${esc(p.zone)}</td>
                 <td class="hide-sm">${esc(p.lead_engineer_name || '-')}</td>
@@ -217,12 +235,12 @@ function renderProjects() {
                 <td>${sectionProgressHTML(p.section_progress)}</td>
                 <td>
                     <div class="acts">
-                        <button class="btn btn-sm btn-open" onclick="openDetail(${p.id})" title="Open">👁</button>
-                        ${canEdit ? `<button class="btn btn-sm btn-edit" onclick="editProject(${p.id})" title="Edit">✏️</button>` : ''}
-                        ${canFiles ? `<button class="btn btn-sm btn-files" onclick="openFiles(${p.id}, '${safeName}')" title="Files">📁</button>` : ''}
-                        ${canDelete ? `<button class="btn btn-sm btn-del" onclick="deleteProject(${p.id}, '${safeName}')" title="Delete">🗑</button>` : ''}
-                        ${canPrint ? `<button class="btn btn-sm btn-print" onclick="doPrint(${p.id})" title="Print">🖨</button>` : ''}
-                        ${canPdf ? `<button class="btn btn-sm btn-pdf" onclick="doPdf(${p.id})" title="PDF">📄</button>` : ''}
+                        <button type="button" class="btn btn-sm btn-open" data-action="open-detail" data-project-id="${projectId}" title="Open">👁</button>
+                        ${canEdit ? `<button type="button" class="btn btn-sm btn-edit" data-action="edit-project" data-project-id="${projectId}" title="Edit">✏️</button>` : ''}
+                        ${canFiles ? `<button type="button" class="btn btn-sm btn-files" data-action="open-project-files" data-project-id="${projectId}" title="Files">📁</button>` : ''}
+                        ${canDelete ? `<button type="button" class="btn btn-sm btn-del" data-action="archive-project" data-project-id="${projectId}" data-project-version="${projectVersion}" title="Archive">🗄</button>` : ''}
+                        ${canPrint ? `<button type="button" class="btn btn-sm btn-print" data-action="print-project" data-project-id="${projectId}" title="Print">🖨</button>` : ''}
+                        ${canPdf ? `<button type="button" class="btn btn-sm btn-pdf" data-action="pdf-project" data-project-id="${projectId}" title="PDF">📄</button>` : ''}
                     </div>
                 </td>
             </tr>
@@ -313,7 +331,7 @@ function buildSectionsForm(project = null) {
             const assigneeHtml = item.assignee_type !== 'none' ? `
                 <div class="fg">
                     <label>Assigned ${item.assignee_type === 'architect' ? 'Architect' : 'Engineer'}</label>
-                    <select class="engineer-select item-assignee" data-item="${item.id}" onchange="handleEngineerAdd(this)">
+                    <select class="engineer-select item-assignee" data-item="${item.id}" data-action="engineer-select">
                         ${engineerOptions(assigneeId)}
                     </select>
                 </div>` : '';
@@ -333,7 +351,7 @@ function buildSectionsForm(project = null) {
                     <div class="fgrid">
                         <div class="fg">
                             <label>Status</label>
-                            <select class="status-select item-status" data-item="${item.id}" onchange="handleStatusAdd(this); updateLiveSectionProgress();">
+                            <select class="status-select item-status" data-item="${item.id}" data-action="status-select">
                                 ${statusOptions(statusId)}
                             </select>
                         </div>
@@ -349,7 +367,7 @@ function buildSectionsForm(project = null) {
 
         return `
             <div class="fsec project-section" data-section="${section.id}">
-                <div class="fsec-head" onclick="toggleSectionBody(this)">
+                <div class="fsec-head" data-action="toggle-section" role="button" tabindex="0">
                     <span>${esc(section.icon)}</span>
                     <h3>${esc(section.name)}</h3>
                     <span class="section-live-pct" id="section-live-${section.id}">0%</span>
@@ -456,13 +474,20 @@ function collectProjectValues() {
 async function saveProject() {
     const name = $('projectName').value.trim();
     const client = $('clientName').value.trim();
+    const projectId = parseInt($('projectId').value, 10) || 0;
+    const version = projectId > 0 ? parseInt(CURRENT_PROJECT && CURRENT_PROJECT.version, 10) : 0;
     if (!name) { toast('Project name is required', 'err'); $('projectName').focus(); return; }
     if (!client) { toast('Client name is required', 'err'); $('clientName').focus(); return; }
+    if (projectId > 0 && (!Number.isInteger(version) || version < 1)) {
+        toast('This project must be reloaded before it can be updated.', 'err');
+        return;
+    }
 
     const payload = {
         action: 'save_project',
         project: {
-            id: parseInt($('projectId').value) || 0,
+            id: projectId,
+            version,
             project_name: name,
             client_name: client,
             zone: $('zone').value.trim(),
@@ -476,11 +501,15 @@ async function saveProject() {
 
     const d = await postJSON(payload);
     if (d.success) {
+        if (CURRENT_PROJECT && Number.isInteger(parseInt(d.version, 10))) {
+            CURRENT_PROJECT.version = parseInt(d.version, 10);
+        }
         toast('Project saved successfully', 'ok');
         closeProjectForm();
         await loadProjects();
     } else {
-        toast(d.error || 'Save failed', 'err');
+        const conflict = /project (changed|version is required)/i.test(String(d.error || ''));
+        toast(conflict ? 'This project changed elsewhere. Reload it before saving again.' : (d.error || 'Save failed'), 'err');
     }
 }
 
@@ -555,9 +584,12 @@ async function openDetail(id) {
     if (editBtn) {
         if (canEdit) {
             editBtn.style.display = 'inline-flex';
-            editBtn.onclick = () => { closeDetail(); editProject(p.id); };
+            editBtn.dataset.action = 'edit-detail-project';
+            editBtn.dataset.projectId = String(parseInt(p.id) || 0);
         } else {
             editBtn.style.display = 'none';
+            delete editBtn.dataset.action;
+            delete editBtn.dataset.projectId;
         }
     }
 
@@ -598,16 +630,79 @@ function editSelectedProject() {
 // ============================================
 // DELETE, PRINT, PDF
 // ============================================
-function deleteProject(id, name) {
-    if (!confirm(`Delete "${name}"?`)) return;
+function deleteProject(id, name, version) {
+    if (!Number.isSafeInteger(version) || version < 1) {
+        toast('This project must be refreshed before it can be archived.', 'err');
+        return;
+    }
+    if (!confirm(`Archive "${name}"? You can restore it through the Archive workflow.`)) return;
     api('delete_project.php', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
+        body: JSON.stringify({ id, version })
     }).then(d => {
-        if (d.success) { toast('Deleted', 'ok'); loadProjects(); }
+        if (d.success) { toast('Project archived', 'ok'); loadProjects(); }
         else toast(d.error || 'Failed', 'err');
     });
+}
+
+async function openArchivedProjects() {
+    openOverlay('archivedProjectsModal');
+    await loadArchivedProjects();
+}
+
+async function loadArchivedProjects() {
+    const tbody = $('archivedProjectsTableBody');
+    const empty = $('archivedProjectsEmpty');
+    if (!tbody) return;
+    tbody.innerHTML = '<tr><td colspan="5" class="files-empty">Loading...</td></tr>';
+    if (empty) empty.style.display = 'none';
+
+    try {
+        const data = await api('load_projects.php?archived=1');
+        if (!data.success) {
+            tbody.innerHTML = `<tr><td colspan="5" class="files-empty">${esc(data.error || 'Failed to load archive')}</td></tr>`;
+            return;
+        }
+        const archived = Array.isArray(data.projects) ? data.projects : [];
+        if (!archived.length) {
+            tbody.innerHTML = '';
+            if (empty) empty.style.display = 'block';
+            return;
+        }
+        tbody.innerHTML = archived.map(project => {
+            const id = parseInt(project.id, 10) || 0;
+            const version = parseInt(project.version, 10) || 0;
+            return `<tr>
+                <td>${esc(project.project_name)}</td>
+                <td>${esc(project.client_name)}</td>
+                <td>${esc(project.deleted_at || '-')}<br><small>${esc(project.deleted_by_name || '')}</small></td>
+                <td>${esc(project.deletion_reason || '-')}</td>
+                <td><button type="button" class="btn btn-sm btn-open" data-action="restore-project" data-project-id="${id}" data-project-version="${version}">Restore</button></td>
+            </tr>`;
+        }).join('');
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" class="files-empty">${esc(e.message)}</td></tr>`;
+    }
+}
+
+async function restoreArchivedProject(id, version) {
+    if (!Number.isSafeInteger(id) || id <= 0 || !Number.isSafeInteger(version) || version < 1) {
+        toast('Invalid archived project', 'err');
+        return;
+    }
+    if (!confirm('Restore this project and its existing access assignments?')) return;
+    const data = await api('restore_project.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, version })
+    });
+    if (data.success) {
+        toast('Project restored', 'ok');
+        await Promise.all([loadArchivedProjects(), loadProjects()]);
+    } else {
+        toast(data.error || 'Project restore failed', 'err');
+    }
 }
 
 function doPrint(id) {
@@ -657,7 +752,7 @@ function renderEngineerSettings() {
             <h3 style="margin-bottom:10px;">Engineers / Architects</h3>
             <textarea id="engineersText" rows="12" style="width:100%;border:1px solid #e2e8f0;border-radius:12px;padding:12px;font-family:inherit;">${META.engineers.map(e => esc(e.name)).join('\n')}</textarea>
             <div style="margin-top:12px;">
-                <button class="btn btn-primary" onclick="saveEngineersSettings()">Save Engineers</button>
+                <button type="button" class="btn btn-primary" data-action="save-engineers-settings">Save Engineers</button>
             </div>
         </div>`;
 }
@@ -676,8 +771,8 @@ function renderStatusSettings() {
         <div class="settings-box">
             <h3 style="margin-bottom:10px;">Statuses</h3>
             <div id="statusRows">${META.statuses.map(s => statusRowHTML(s)).join('')}</div>
-            <button class="add-mini" onclick="addStatusRow()">＋ Add Status</button>
-            <button class="btn btn-primary" style="margin-left:8px;" onclick="saveStatusSettings()">Save</button>
+            <button type="button" class="add-mini" data-action="add-status-row">＋ Add Status</button>
+            <button type="button" class="btn btn-primary" style="margin-left:8px;" data-action="save-status-settings">Save</button>
         </div>`;
 }
 
@@ -686,7 +781,7 @@ function statusRowHTML(s = {}) {
         <input type="text" class="set-status-name" value="${esc(s.name || '')}">
         <input type="number" class="set-status-percent" min="0" max="100" value="${esc(s.percent ?? 0)}">
         <input type="color" class="set-status-color" value="${esc(s.color || '#6366f1')}">
-        <button class="icon-btn" onclick="this.closest('.status-setting-row').remove()">×</button>
+        <button type="button" class="icon-btn" data-action="remove-closest" data-remove-selector=".status-setting-row">×</button>
     </div>`;
 }
 
@@ -711,8 +806,8 @@ function renderSectionSettings() {
         <div class="settings-box">
             <h3 style="margin-bottom:10px;">Sections & Weights</h3>
             <div id="sectionSettingsList">${META.sections.map(s => sectionSettingsHTML(s)).join('')}</div>
-            <button class="add-mini" onclick="addSectionSettingsCard()">＋ Add Section</button>
-            <button class="btn btn-primary" style="margin-left:8px;" onclick="saveSectionSettings()">Save</button>
+            <button type="button" class="add-mini" data-action="add-section-card">＋ Add Section</button>
+            <button type="button" class="btn btn-primary" style="margin-left:8px;" data-action="save-section-settings">Save</button>
         </div>`;
 }
 
@@ -722,10 +817,10 @@ function sectionSettingsHTML(section = {}) {
             <input type="text" class="set-section-icon" value="${esc(section.icon || '📌')}">
             <input type="text" class="set-section-name" value="${esc(section.name || '')}">
             <input type="number" class="set-section-weight" value="${esc(section.weight ?? 0)}">
-            <button class="icon-btn" onclick="this.closest('.settings-section-card').remove()">×</button>
+            <button type="button" class="icon-btn" data-action="remove-closest" data-remove-selector=".settings-section-card">×</button>
         </div>
         <div class="settings-items">${(section.items || []).map(item => itemSettingsHTML(item)).join('')}</div>
-        <button class="add-mini" onclick="addItemSettingsRow(this)">＋ Add Item</button>
+        <button type="button" class="add-mini" data-action="add-item-row">＋ Add Item</button>
     </div>`;
 }
 
@@ -742,7 +837,7 @@ function itemSettingsHTML(item = {}) {
             <option value="1" ${parseInt(item.has_comment??1)?'selected':''}>Comment</option>
             <option value="0" ${!parseInt(item.has_comment??1)?'selected':''}>No Comment</option>
         </select>
-        <button class="icon-btn" onclick="this.closest('.settings-item-row').remove()">×</button>
+        <button type="button" class="icon-btn" data-action="remove-closest" data-remove-selector=".settings-item-row">×</button>
     </div>`;
 }
 
@@ -780,8 +875,10 @@ async function saveSectionSettings() {
 // ============================================
 let PRI_ENGINEERS = [];
 let PRI_FILTER = 'all';
+let PRI_SHOW_ARCHIVED = false;
 
 async function openPriorities() {
+    PRI_SHOW_ARCHIVED = false;
     openOverlay('prioritiesModal');
     await priLoadTasks();
 }
@@ -791,12 +888,24 @@ async function priLoadTasks() {
     if (!list) return;
     list.innerHTML = '<div class="files-empty">Loading...</div>';
     try {
-        const data = await api('priorities.php?action=list&filter=' + encodeURIComponent(PRI_FILTER));
-        if (!data.success) { list.innerHTML = `<div class="files-empty">${esc(data.error || 'Failed')}</div>`; return; }
-        PRI_ENGINEERS = data.engineers || [];
-        priRenderAssigneeSelect();
-        priRenderStats(data.stats);
-        priRenderTasks(data.tasks || []);
+        const endpoint = PRI_SHOW_ARCHIVED
+            ? 'priorities.php?action=archived'
+            : 'priorities.php?action=list&filter=' + encodeURIComponent(PRI_FILTER);
+        const data = await api(endpoint);
+        if (!data.success) {
+            list.innerHTML = `<div class="files-empty">${esc(data.error || 'Failed')}</div>`;
+            return;
+        }
+        if (PRI_SHOW_ARCHIVED) {
+            const archivedTasks = data.tasks || [];
+            priRenderStats({ total: archivedTasks.length, pending: 0, done: 0 });
+            priRenderTasks(archivedTasks, true);
+        } else {
+            PRI_ENGINEERS = data.engineers || [];
+            priRenderAssigneeSelect();
+            priRenderStats(data.stats);
+            priRenderTasks(data.tasks || [], false);
+        }
     } catch (e) {
         list.innerHTML = `<div class="files-empty">Error: ${esc(e.message)}</div>`;
     }
@@ -822,40 +931,72 @@ function priRenderAssigneeSelect() {
     select.innerHTML = html;
 }
 
-function priRenderTasks(tasks) {
+function priRenderTasks(tasks, archived = false) {
     const list = $('priTaskList');
     if (!list) return;
     if (!tasks.length) { list.innerHTML = '<div class="files-empty">No tasks yet.</div>'; return; }
     list.innerHTML = tasks.map((task, i) => {
         const isDone = parseInt(task.is_done) === 1;
+        const taskId = parseInt(task.id, 10) || 0;
+        const taskVersion = parseInt(task.version, 10) || 0;
+        const priority = ['critical', 'high', 'medium', 'low'].includes(task.priority) ? task.priority : 'medium';
         return `
             <div class="pri-task-card ${isDone ? 'pri-task-done' : ''}">
-                <div class="pri-task-check" onclick="priToggle(${task.id})">${isDone ? '☑' : '☐'}</div>
+                ${archived
+                    ? '<span class="pri-task-check" aria-hidden="true">🗄</span>'
+                    : `<button type="button" class="pri-task-check" data-action="priority-toggle" data-priority-id="${taskId}" data-priority-version="${taskVersion}">${isDone ? '☑' : '☐'}</button>`}
                 <div class="pri-task-number">#${i + 1}</div>
                 <div class="pri-task-body">
                     <div class="pri-task-title">${esc(task.title)}</div>
                     <div class="pri-task-meta">
-                        <span class="pri-badge pri-badge-${task.priority}">${task.priority}</span>
+                        <span class="pri-badge pri-badge-${priority}">${esc(priority)}</span>
                         ${task.assignee_name ? `<span>👤 ${esc(task.assignee_name)}</span>` : ''}
                         ${task.due_date ? `<span>📅 ${esc(task.due_date)}</span>` : ''}
                     </div>
                 </div>
                 <div class="pri-task-actions">
-                    <button class="btn btn-sm btn-del" onclick="priDelete(${task.id})">🗑</button>
+                    ${archived
+                        ? `<button type="button" class="btn btn-sm btn-open" data-action="priority-restore" data-priority-id="${taskId}" data-priority-version="${taskVersion}" title="Restore task">Restore</button>`
+                        : `<button type="button" class="btn btn-sm btn-del" data-action="priority-delete" data-priority-id="${taskId}" data-priority-version="${taskVersion}" title="Archive task">🗄</button>`}
                 </div>
             </div>`;
     }).join('');
 }
 
-async function priToggle(id) {
-    const data = await api('priorities.php?action=toggle', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
+async function priToggle(id, version = 0) {
+    const payload = { id };
+    if (Number.isInteger(version) && version > 0) payload.version = version;
+    const data = await api('priorities.php?action=toggle', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
     if (data.success) await priLoadTasks();
+    else toast(data.error || 'Task update failed', 'err');
 }
 
-async function priDelete(id) {
-    if (!confirm('Delete this task?')) return;
-    const data = await api('priorities.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id}) });
-    if (data.success) { toast('Deleted', 'ok'); await priLoadTasks(); }
+async function priDelete(id, version = 0) {
+    if (!confirm('Archive this task? It can be restored by an administrator.')) return;
+    const payload = { id };
+    if (Number.isInteger(version) && version > 0) payload.version = version;
+    const data = await api('priorities.php?action=delete', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    if (data.success) { toast('Task archived', 'ok'); await priLoadTasks(); }
+    else toast(data.error || 'Task archive failed', 'err');
+}
+
+async function priRestore(id, version = 0) {
+    if (!confirm('Restore this priority task?')) return;
+    const payload = { id };
+    if (Number.isInteger(version) && version > 0) payload.version = version;
+    const data = await api('priorities.php?action=restore', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    if (data.success) { toast('Task restored', 'ok'); await priLoadTasks(); }
+    else toast(data.error || 'Task restore failed', 'err');
+}
+
+function priShowActive() {
+    PRI_SHOW_ARCHIVED = false;
+    priLoadTasks();
+}
+
+function priShowArchived() {
+    PRI_SHOW_ARCHIVED = true;
+    priLoadTasks();
 }
 
 function priFilter(filter, btn) {
@@ -929,10 +1070,10 @@ async function loadUsers() {
                 <td><span class="badge ${u.role==='admin'?'b-ip':'b-ok'}">${esc(u.role === 'admin' ? 'Admin / Head Engineer' : (u.account_type === 'client' ? 'Client / Owner' : 'Employee'))}</span></td>
                 <td><span class="badge ${parseInt(u.active)===1?'b-ok':'b-rv'}">${parseInt(u.active)===1 ? 'Active' : 'Inactive'}</span></td>
                 <td>
-                    <button class="btn btn-sm btn-edit" onclick="editUser(${u.id})">✏️</button>
+                    <button type="button" class="btn btn-sm btn-edit" data-action="edit-user" data-user-id="${parseInt(u.id) || 0}">✏️</button>
                     ${parseInt(u.active) === 1
-                        ? `<button class="btn btn-sm btn-del" onclick="deleteUser(${u.id})" title="Deactivate">⛔</button>`
-                        : `<button class="btn btn-sm btn-open" onclick="activateUser(${u.id})" title="Activate">↻</button>`}
+                        ? `<button type="button" class="btn btn-sm btn-del" data-action="deactivate-user" data-user-id="${parseInt(u.id) || 0}" title="Deactivate">⛔</button>`
+                        : `<button type="button" class="btn btn-sm btn-open" data-action="activate-user" data-user-id="${parseInt(u.id) || 0}" title="Activate">↻</button>`}
                 </td>
             </tr>`).join('');
     }
@@ -1178,7 +1319,7 @@ async function fmLoadCurrentFolder() {
         if (crumbBox && data.breadcrumbs) {
             crumbBox.innerHTML = data.breadcrumbs.map((c, idx) => {
                 const isLast = idx === data.breadcrumbs.length - 1;
-                return `<span class="${isLast ? 'fm-crumb current' : 'fm-crumb'}" onclick="fmOpenFolder('${esc(c.path)}')">${esc(c.name)}</span>`;
+                return `<button type="button" class="${isLast ? 'fm-crumb current' : 'fm-crumb'}" data-action="fm-open" data-fm-path="${esc(c.path)}">${esc(c.name)}</button>`;
             }).join('<span class="fm-sep">/</span>');
         }
 
@@ -1190,41 +1331,45 @@ async function fmLoadCurrentFolder() {
         let html = '<div class="fm-grid">';
 
         (data.folders || []).forEach(folder => {
+            const folderPath = esc(folder.path);
+            const folderName = esc(folder.name);
             if (folder.is_default) {
                 html += `
-                    <div class="fm-item fm-folder fm-folder-default" ondblclick="fmOpenFolder('${esc(folder.path)}')">
+                    <div class="fm-item fm-folder fm-folder-default" data-double-action="fm-open" data-fm-path="${folderPath}">
                         <div class="fm-icon">📁</div>
-                        <div class="fm-name">${esc(folder.name)}</div>
+                        <div class="fm-name">${folderName}</div>
                         <div class="fm-meta">Default folder</div>
                         <div class="fm-actions">
-                            <button class="btn btn-sm btn-open" onclick="event.stopPropagation();fmOpenFolder('${esc(folder.path)}')">Open</button>
+                            <button type="button" class="btn btn-sm btn-open" data-action="fm-open" data-fm-path="${folderPath}">Open</button>
                         </div>
                     </div>`;
             } else {
                 html += `
-                    <div class="fm-item fm-folder" ondblclick="fmOpenFolder('${esc(folder.path)}')">
+                    <div class="fm-item fm-folder" data-double-action="fm-open" data-fm-path="${folderPath}">
                         <div class="fm-icon">📁</div>
-                        <div class="fm-name">${esc(folder.name)}</div>
+                        <div class="fm-name">${folderName}</div>
                         <div class="fm-meta">${esc(folder.modified)}</div>
                         <div class="fm-actions">
-                            <button class="btn btn-sm btn-open" onclick="event.stopPropagation();fmOpenFolder('${esc(folder.path)}')">Open</button>
-                            <button class="btn btn-sm btn-edit" onclick="event.stopPropagation();fmRename('${esc(folder.path)}','${esc(folder.name)}')">Rename</button>
-                            <button class="btn btn-sm btn-del" onclick="event.stopPropagation();fmDelete('${esc(folder.path)}','${esc(folder.name)}',true)">Delete</button>
+                            <button type="button" class="btn btn-sm btn-open" data-action="fm-open" data-fm-path="${folderPath}">Open</button>
+                            <button type="button" class="btn btn-sm btn-edit" data-action="fm-rename" data-fm-path="${folderPath}" data-fm-name="${folderName}">Rename</button>
+                            <button type="button" class="btn btn-sm btn-del" data-action="fm-delete" data-fm-path="${folderPath}" data-fm-name="${folderName}" data-fm-folder="1">Delete</button>
                         </div>
                     </div>`;
             }
         });
 
         (data.files || []).forEach(file => {
+            const filePath = esc(file.path);
+            const fileName = esc(file.name);
             html += `
                 <div class="fm-item fm-file">
                     <div class="fm-icon">${fmFileIcon(file.ext)}</div>
-                    <div class="fm-name">${esc(file.name)}</div>
+                    <div class="fm-name">${fileName}</div>
                     <div class="fm-meta">${esc(String(file.ext||'').toUpperCase())} • ${esc(file.size_text)} • ${esc(file.modified)}</div>
                     <div class="fm-actions">
-                        <a class="btn btn-sm btn-files" href="${esc(file.download_url)}" target="_blank">Download</a>
-                        <button class="btn btn-sm btn-edit" onclick="fmRename('${esc(file.path)}','${esc(file.name)}')">Rename</button>
-                        <button class="btn btn-sm btn-del" onclick="fmDelete('${esc(file.path)}','${esc(file.name)}',false)">Delete</button>
+                        <a class="btn btn-sm btn-files" href="${esc(file.download_url)}" target="_blank" rel="noopener">Download</a>
+                        <button type="button" class="btn btn-sm btn-edit" data-action="fm-rename" data-fm-path="${filePath}" data-fm-name="${fileName}">Rename</button>
+                        <button type="button" class="btn btn-sm btn-del" data-action="fm-delete" data-fm-path="${filePath}" data-fm-name="${fileName}" data-fm-folder="0">Delete</button>
                     </div>
                 </div>`;
         });
@@ -1300,6 +1445,310 @@ async function fmDelete(path, name, isFolder) {
     } catch(e) { toast('Error: '+e.message,'err'); }
     finally { loading(false); }
 }
+
+// ============================================
+// CSP-SAFE EVENT DELEGATION
+// ============================================
+const NAWARA_OVERLAYS = new Set([
+    'updateModal', 'settingsModal', 'prioritiesModal', 'usersModal', 'userFormModal', 'filesModal', 'detailModal', 'projectModal', 'archivedProjectsModal'
+]);
+const NAWARA_REMOVE_SELECTORS = new Set([
+    '.status-setting-row', '.settings-section-card', '.settings-item-row'
+]);
+
+function delegatedProjectId(el) {
+    const id = Number.parseInt(el.dataset.projectId || '', 10);
+    return Number.isSafeInteger(id) && id > 0 ? id : 0;
+}
+
+function delegatedUserId(el) {
+    const id = Number.parseInt(el.dataset.userId || '', 10);
+    return Number.isSafeInteger(id) && id > 0 ? id : 0;
+}
+
+function delegatedProject(id) {
+    return PROJECTS.find(project => Number(project.id) === id) || null;
+}
+
+async function dispatchNawaraAction(el, event) {
+    const action = el.dataset.action;
+    if (!action) return;
+
+    switch (action) {
+        case 'toast-close':
+            el.closest('.toast')?.remove();
+            return;
+        case 'toggle-user-menu':
+            toggleUserMenu();
+            return;
+        case 'open-project-form':
+            await openProjectForm();
+            return;
+        case 'close-project-form':
+            closeProjectForm();
+            return;
+        case 'save-project':
+        case 'project-form':
+            await saveProject();
+            return;
+        case 'open-update-modal':
+            openUpdateModal();
+            return;
+        case 'edit-selected-project':
+            editSelectedProject();
+            return;
+        case 'open-detail': {
+            const id = delegatedProjectId(el);
+            if (id) await openDetail(id);
+            return;
+        }
+        case 'edit-project': {
+            const id = delegatedProjectId(el);
+            if (id) await editProject(id);
+            return;
+        }
+        case 'edit-detail-project': {
+            const id = delegatedProjectId(el);
+            if (id) {
+                closeDetail();
+                await editProject(id);
+            }
+            return;
+        }
+        case 'archive-project': {
+            const id = delegatedProjectId(el);
+            const project = delegatedProject(id);
+            const version = Number.parseInt(el.dataset.projectVersion || '', 10);
+            if (project) deleteProject(id, String(project.project_name || 'this project'), Number.isSafeInteger(version) ? version : 0);
+            return;
+        }
+        case 'open-archived-projects':
+            await openArchivedProjects();
+            return;
+        case 'restore-project': {
+            const id = delegatedProjectId(el);
+            const version = Number.parseInt(el.dataset.projectVersion || '', 10);
+            await restoreArchivedProject(id, Number.isSafeInteger(version) ? version : 0);
+            return;
+        }
+        case 'open-project-files': {
+            const id = delegatedProjectId(el);
+            const project = delegatedProject(id);
+            if (project) openFiles(id, String(project.project_name || ''));
+            return;
+        }
+        case 'print-project': {
+            const id = delegatedProjectId(el);
+            if (id) doPrint(id);
+            return;
+        }
+        case 'pdf-project': {
+            const id = delegatedProjectId(el);
+            if (id) doPdf(id);
+            return;
+        }
+        case 'close-detail':
+            closeDetail();
+            return;
+        case 'close-files-modal':
+            closeFilesModal();
+            return;
+        case 'close-overlay': {
+            const overlay = el.dataset.overlay || '';
+            if (NAWARA_OVERLAYS.has(overlay)) closeOverlay(overlay);
+            return;
+        }
+        case 'refresh-projects':
+            await loadProjects();
+            return;
+        case 'search-projects':
+            searchProjects();
+            return;
+        case 'open-settings':
+            await openSettings();
+            return;
+        case 'show-settings-tab': {
+            const tab = el.dataset.tab || '';
+            if (['engineers', 'statuses', 'sections'].includes(tab)) showSettingsTab(tab);
+            return;
+        }
+        case 'save-engineers-settings':
+            await saveEngineersSettings();
+            return;
+        case 'add-status-row':
+            addStatusRow();
+            return;
+        case 'save-status-settings':
+            await saveStatusSettings();
+            return;
+        case 'add-section-card':
+            addSectionSettingsCard();
+            return;
+        case 'add-item-row':
+            addItemSettingsRow(el);
+            return;
+        case 'save-section-settings':
+            await saveSectionSettings();
+            return;
+        case 'remove-closest': {
+            const selector = el.dataset.removeSelector || '';
+            if (NAWARA_REMOVE_SELECTORS.has(selector)) el.closest(selector)?.remove();
+            return;
+        }
+        case 'toggle-section':
+            toggleSectionBody(el);
+            return;
+        case 'open-priorities':
+            await openPriorities();
+            return;
+        case 'priority-filter': {
+            const filter = el.dataset.filter || '';
+            if (['all', 'pending', 'done'].includes(filter)) priFilter(filter, el);
+            return;
+        }
+        case 'priority-toggle': {
+            const id = Number.parseInt(el.dataset.priorityId || '', 10);
+            const version = Number.parseInt(el.dataset.priorityVersion || '', 10);
+            if (Number.isSafeInteger(id) && id > 0) await priToggle(id, Number.isSafeInteger(version) ? version : 0);
+            return;
+        }
+        case 'priority-delete': {
+            const id = Number.parseInt(el.dataset.priorityId || '', 10);
+            const version = Number.parseInt(el.dataset.priorityVersion || '', 10);
+            if (Number.isSafeInteger(id) && id > 0) await priDelete(id, Number.isSafeInteger(version) ? version : 0);
+            return;
+        }
+        case 'priority-show-add':
+            priShowAddForm();
+            return;
+        case 'priority-show-active':
+            priShowActive();
+            return;
+        case 'priority-show-archived':
+            priShowArchived();
+            return;
+        case 'priority-restore': {
+            const id = Number.parseInt(el.dataset.priorityId || '', 10);
+            const version = Number.parseInt(el.dataset.priorityVersion || '', 10);
+            if (Number.isSafeInteger(id) && id > 0) await priRestore(id, Number.isSafeInteger(version) ? version : 0);
+            return;
+        }
+        case 'priority-hide-add':
+            priHideAddForm();
+            return;
+        case 'priority-add':
+            await priAddTask();
+            return;
+        case 'open-users-modal':
+            await openUsersModal();
+            return;
+        case 'open-user-form':
+            openUserForm();
+            return;
+        case 'edit-user': {
+            const id = delegatedUserId(el);
+            if (id) editUser(id);
+            return;
+        }
+        case 'deactivate-user': {
+            const id = delegatedUserId(el);
+            if (id) await deleteUser(id);
+            return;
+        }
+        case 'activate-user': {
+            const id = delegatedUserId(el);
+            if (id) await activateUser(id);
+            return;
+        }
+        case 'show-user-tab': {
+            const tab = el.dataset.tab || '';
+            if (['info', 'perms'].includes(tab)) showUserTab(tab, el);
+            return;
+        }
+        case 'save-user':
+            await window.saveUser();
+            return;
+        case 'file-create-folder':
+            await fmCreateFolder();
+            return;
+        case 'file-reload':
+            fmReload();
+            return;
+        case 'file-home':
+            fmGoHome();
+            return;
+        case 'fm-open':
+            fmOpenFolder(el.dataset.fmPath || '');
+            return;
+        case 'fm-rename':
+            await fmRename(el.dataset.fmPath || '', el.dataset.fmName || '');
+            return;
+        case 'fm-delete':
+            await fmDelete(el.dataset.fmPath || '', el.dataset.fmName || '', el.dataset.fmFolder === '1');
+            return;
+        default:
+            return;
+    }
+}
+
+function delegatedActionError(error) {
+    console.error('NawAra action failed:', error);
+    toast('The requested action could not be completed.', 'err');
+}
+
+document.addEventListener('click', event => {
+    const el = event.target instanceof Element ? event.target.closest('[data-action]') : null;
+    if (!el || ['FORM', 'INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName)) return;
+    // Click actions are controls only. Form and field actions are handled by
+    // their own submit/change listeners so normal native field behavior stays intact.
+    event.preventDefault();
+    void dispatchNawaraAction(el, event).catch(delegatedActionError);
+});
+
+document.addEventListener('change', event => {
+    const el = event.target instanceof Element ? event.target.closest('[data-action]') : null;
+    if (!el) return;
+    const action = el.dataset.action;
+    if (action === 'engineer-select') {
+        void handleEngineerAdd(el).catch(delegatedActionError);
+    } else if (action === 'status-select') {
+        void handleStatusAdd(el).then(updateLiveSectionProgress).catch(delegatedActionError);
+    } else if (action === 'toggle-permissions') {
+        togglePerms();
+    } else if (action === 'toggle-project-list') {
+        toggleProjectsList();
+    } else if (action === 'file-upload-input') {
+        void fmUploadFiles(el.files).catch(delegatedActionError);
+        el.value = '';
+    }
+});
+
+document.addEventListener('keyup', event => {
+    const el = event.target instanceof Element ? event.target.closest('[data-action="project-search-input"]') : null;
+    if (el) handleSearch(event);
+});
+
+document.addEventListener('submit', event => {
+    const el = event.target instanceof Element ? event.target.closest('[data-action="project-form"]') : null;
+    if (!el) return;
+    event.preventDefault();
+    void dispatchNawaraAction(el, event).catch(delegatedActionError);
+});
+
+document.addEventListener('dblclick', event => {
+    if (event.target instanceof Element && event.target.closest('.fm-actions')) return;
+    const el = event.target instanceof Element ? event.target.closest('[data-double-action="fm-open"]') : null;
+    if (!el) return;
+    fmOpenFolder(el.dataset.fmPath || '');
+});
+
+document.addEventListener('keydown', event => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const el = event.target instanceof Element ? event.target.closest('[data-action]') : null;
+    if (!el || !(el.getAttribute('role') === 'button' || el.dataset.action === 'toggle-section')) return;
+    event.preventDefault();
+    void dispatchNawaraAction(el, event).catch(delegatedActionError);
+});
 
 // ============================================
 // INIT

@@ -1,7 +1,7 @@
 <?php
 /**
  * config.php
- * Shared application, session and authorization configuration.
+ * Shared application, session, storage and authorization configuration.
  */
 
 $appEnv = strtolower(trim((string)(getenv('NAWARA_APP_ENV') ?: 'production')));
@@ -9,6 +9,7 @@ if (!in_array($appEnv, ['development', 'staging', 'production'], true)) {
     $appEnv = 'development';
 }
 define('APP_ENV', $appEnv);
+define('APP_ROOT', __DIR__);
 
 if (APP_ENV === 'production') {
     ini_set('display_errors', '0');
@@ -19,6 +20,7 @@ if (APP_ENV === 'production') {
     ini_set('display_startup_errors', '1');
     error_reporting(E_ALL);
 }
+ini_set('expose_php', '0');
 
 define('APP_NAME', 'NawAra Studio ');
 define('APP_SUBTITLE', 'Projects Progress Report');
@@ -26,27 +28,113 @@ define('APP_VERSION', '1.2.0 - Copyright © 2026 Ahmad Najeem Nik');
 
 date_default_timezone_set('Asia/Kabul');
 
-$configuredDataDir = trim((string)(getenv('NAWARA_DATA_DIR') ?: ''));
-$dataDir = $configuredDataDir !== ''
-    ? rtrim($configuredDataDir, DIRECTORY_SEPARATOR)
-    : __DIR__ . '/data';
-
-if (!is_dir($dataDir)) {
-    @mkdir($dataDir, 0750, true);
+/**
+ * Production storage is intentionally fail-closed. SQLite, WAL/SHM files and
+ * user uploads must never fall back into the directory served by the web server.
+ */
+function nawaraConfigurationError(string $message): void
+{
+    error_log('NawAra configuration error: ' . $message);
+    if (!headers_sent()) {
+        http_response_code(500);
+        header('Content-Type: text/plain; charset=UTF-8');
+        header('Cache-Control: no-store');
+    }
+    echo 'Server configuration error.';
+    exit;
 }
 
+function nawaraPathIsAbsolute(string $path): bool
+{
+    if (DIRECTORY_SEPARATOR === '\\') {
+        return (bool)preg_match('/^[A-Za-z]:[\\\\\/]/', $path);
+    }
+
+    return str_starts_with($path, '/');
+}
+
+function nawaraPathIsInside(string $path, string $root): bool
+{
+    $normalizedPath = rtrim(str_replace('\\', '/', $path), '/');
+    $normalizedRoot = rtrim(str_replace('\\', '/', $root), '/');
+
+    return $normalizedPath === $normalizedRoot
+        || str_starts_with($normalizedPath . '/', $normalizedRoot . '/');
+}
+
+function nawaraResolvePrivateStorageDirectory(string $environmentVariable, string $developmentFallback, string $label): string
+{
+    $configured = trim((string)(getenv($environmentVariable) ?: ''));
+    if ($configured === '') {
+        if (APP_ENV === 'production') {
+            nawaraConfigurationError($environmentVariable . ' is required in production');
+        }
+        $candidate = $developmentFallback;
+    } else {
+        if (!nawaraPathIsAbsolute($configured)) {
+            nawaraConfigurationError($environmentVariable . ' must be an absolute path');
+        }
+        $candidate = rtrim($configured, DIRECTORY_SEPARATOR);
+    }
+
+    if (!is_dir($candidate) && !@mkdir($candidate, 0750, true) && !is_dir($candidate)) {
+        nawaraConfigurationError('Unable to create ' . $label . ' directory');
+    }
+
+    $resolved = realpath($candidate);
+    if ($resolved === false || !is_dir($resolved)) {
+        nawaraConfigurationError('Unable to resolve ' . $label . ' directory');
+    }
+
+    if (APP_ENV === 'production' && nawaraPathIsInside($resolved, APP_ROOT)) {
+        nawaraConfigurationError($label . ' directory must be outside the application document root');
+    }
+
+    if (!is_writable($resolved)) {
+        nawaraConfigurationError($label . ' directory is not writable by PHP');
+    }
+
+    @chmod($resolved, 0750);
+    return $resolved;
+}
+
+$dataDir = nawaraResolvePrivateStorageDirectory(
+    'NAWARA_DATA_DIR',
+    APP_ROOT . '/data',
+    'private data'
+);
+$uploadsDir = nawaraResolvePrivateStorageDirectory(
+    'NAWARA_UPLOADS_DIR',
+    APP_ROOT . '/uploads',
+    'private uploads'
+);
+
 define('APP_DATA_DIR', $dataDir);
+define('APP_UPLOADS_DIR', $uploadsDir);
 define('DB_PATH', APP_DATA_DIR . '/database.sqlite');
 
 /**
  * SESSION
  */
+$configuredSecureCookie = strtolower(trim((string)(getenv('NAWARA_SESSION_SECURE') ?: '')));
+$isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+$secureCookie = in_array($configuredSecureCookie, ['1', 'true', 'yes'], true) || $isHttps;
+if (APP_ENV === 'production' && !$secureCookie) {
+    nawaraConfigurationError('Production requires HTTPS and a Secure session cookie');
+}
+
+define('NAWARA_SESSION_IDLE_TIMEOUT', max(300, (int)(getenv('NAWARA_SESSION_IDLE_TIMEOUT') ?: 1800)));
+define('NAWARA_SESSION_ABSOLUTE_TIMEOUT', max(
+    NAWARA_SESSION_IDLE_TIMEOUT,
+    (int)(getenv('NAWARA_SESSION_ABSOLUTE_TIMEOUT') ?: 28800)
+));
+
 if (session_status() === PHP_SESSION_NONE) {
-    $configuredSecureCookie = strtolower(trim((string)(getenv('NAWARA_SESSION_SECURE') ?: '')));
-    $isHttps = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
-    $secureCookie = in_array($configuredSecureCookie, ['1', 'true', 'yes'], true) || $isHttps;
     $sessionLifetime = max(900, (int)(getenv('NAWARA_SESSION_LIFETIME') ?: 86400));
+    ini_set('session.use_strict_mode', '1');
+    ini_set('session.use_only_cookies', '1');
+    ini_set('session.cookie_httponly', '1');
 
     session_set_cookie_params([
         'lifetime' => $sessionLifetime,
@@ -59,9 +147,23 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 if (!headers_sent()) {
+    header_remove('X-Powered-By');
     header('X-Content-Type-Options: nosniff');
     header('Referrer-Policy: strict-origin-when-cross-origin');
     header('Permissions-Policy: geolocation=(), camera=(), microphone=()');
+    header('Cross-Origin-Opener-Policy: same-origin');
+    header('Cross-Origin-Resource-Policy: same-origin');
+    header('Cache-Control: no-store, private');
+
+    if (APP_ENV === 'production') {
+        // Inline styles remain temporarily permitted for the legacy layout, but
+        // scripts and event handlers are deliberately restricted to local files.
+        header("Content-Security-Policy: default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src 'self'");
+        header('X-Frame-Options: DENY');
+        if ($secureCookie) {
+            header('Strict-Transport-Security: max-age=31536000; includeSubDomains');
+        }
+    }
 }
 
 /**
@@ -134,6 +236,16 @@ function refreshCurrentUserSession(): ?array
         return null;
     }
 
+    $now = time();
+    $issuedAt = (int)($_SESSION['auth_issued_at'] ?? 0);
+    $lastActivityAt = (int)($_SESSION['auth_last_activity_at'] ?? 0);
+    if ($issuedAt <= 0 || $lastActivityAt <= 0
+        || ($now - $issuedAt) > NAWARA_SESSION_ABSOLUTE_TIMEOUT
+        || ($now - $lastActivityAt) > NAWARA_SESSION_IDLE_TIMEOUT) {
+        clearCurrentSession();
+        return null;
+    }
+
     if (!function_exists('getDB')) {
         return getCurrentUser();
     }
@@ -165,6 +277,7 @@ function refreshCurrentUserSession(): ?array
 
         $_SESSION['user_data'] = $user;
         $_SESSION['auth_version'] = (int)$user['auth_version'];
+        $_SESSION['auth_last_activity_at'] = $now;
 
         return $user;
     } catch (Throwable $e) {
@@ -223,7 +336,7 @@ function requireAdminJson(): void
 
 function app_asset_version(string $file): string
 {
-    $path = __DIR__ . '/' . $file;
+    $path = APP_ROOT . '/' . $file;
     return file_exists($path) ? (string)filemtime($path) : APP_VERSION;
 }
 
@@ -276,6 +389,24 @@ function isClientAccount(?array $user = null): bool
         && ($user['account_type'] ?? 'employee') === 'client';
 }
 
+/** Global role=admin is the documented Head Admin role. A project_admin is a
+ * project membership role and never becomes a global administrator. */
+function isHeadAdmin(?array $user = null): bool
+{
+    $user = $user ?? getCurrentUser();
+    return $user !== null && ($user['role'] ?? '') === 'admin';
+}
+
+function permissionMap($permissions): array
+{
+    if (is_array($permissions)) {
+        return $permissions;
+    }
+
+    $decoded = json_decode((string)$permissions, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
 function canDo(string $permission): bool
 {
     $user = getCurrentUser();
@@ -283,104 +414,151 @@ function canDo(string $permission): bool
         return false;
     }
 
-    if (($user['role'] ?? '') === 'admin') {
+    if (isHeadAdmin($user)) {
         return true;
     }
 
     // The existing dashboard is internal-only. Client permissions are exposed
-    // only by the future publish-gated client portal, not legacy endpoints.
-    if (($user['account_type'] ?? 'employee') === 'client') {
+    // only by the publish-gated client portal, never legacy endpoints.
+    if (isClientAccount($user)) {
         return false;
     }
 
-    $permissions = json_decode($user['permissions'] ?? '{}', true) ?: [];
-    return isset($permissions[$permission]) && $permissions[$permission] === true;
+    $permissions = permissionMap($user['permissions'] ?? '{}');
+    return !empty($permissions[$permission]);
+}
+
+function getProjectMembership(int $projectId, ?int $userId = null): ?array
+{
+    $user = getCurrentUser();
+    $userId = $userId ?? (int)($user['id'] ?? 0);
+    if ($projectId <= 0 || $userId <= 0) {
+        return null;
+    }
+
+    try {
+        $stmt = getDB()->prepare("
+            SELECT m.project_id, m.user_id, m.membership_role, m.permissions, m.active
+            FROM pm_project_members m
+            INNER JOIN pm_projects p ON p.id = m.project_id
+            WHERE m.project_id = :project_id
+              AND m.user_id = :user_id
+              AND m.active = 1
+              AND p.deleted_at = ''
+            LIMIT 1
+        ");
+        $stmt->execute(['project_id' => $projectId, 'user_id' => $userId]);
+        $membership = $stmt->fetch();
+        return $membership ?: null;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function projectIsActive(int $projectId): bool
+{
+    if ($projectId <= 0) {
+        return false;
+    }
+
+    try {
+        $stmt = getDB()->prepare("SELECT 1 FROM pm_projects WHERE id = :id AND deleted_at = '' LIMIT 1");
+        $stmt->execute(['id' => $projectId]);
+        return (bool)$stmt->fetchColumn();
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
+function membershipAllows(array $membership, string $permission): bool
+{
+    $permissions = permissionMap($membership['permissions'] ?? '{}');
+    if (!empty($permissions[$permission])) {
+        return true;
+    }
+
+    // Compatibility aliases are read only. All new project APIs must use the
+    // canonical permission names in the first branch above.
+    $aliases = [
+        'view_project' => ['view'],
+        'edit_project' => ['edit', 'edit_tasks', 'update_any_task'],
+        'delete_project' => ['delete'],
+        'print_reports' => ['print', 'view_reports'],
+        'download_reports' => ['pdf', 'view_reports'],
+        'view_files' => ['files'],
+        'manage_files' => ['files'],
+    ];
+
+    foreach ($aliases[$permission] ?? [] as $alias) {
+        if (!empty($permissions[$alias])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Canonical project authorization for all new APIs. pm_project_members is the
+ * source of truth; pm_project_access is retained only as a legacy UI adapter.
+ */
+function canDoOnProjectPermission(int $projectId, string $permission): bool
+{
+    $user = getCurrentUser();
+    if (!$user || $projectId <= 0 || isClientAccount($user) || !projectIsActive($projectId)) {
+        return false;
+    }
+
+    if (isHeadAdmin($user)) {
+        return true;
+    }
+
+    $globalPermissions = permissionMap($user['permissions'] ?? '{}');
+    if (!empty($globalPermissions['view_all_projects'])) {
+        $globalAliases = [
+            'view_project' => 'view_all_projects',
+            'edit_project' => 'edit',
+            'delete_project' => 'delete',
+            'print_reports' => 'print',
+            'download_reports' => 'pdf',
+            'view_files' => 'files',
+            'manage_files' => 'files',
+        ];
+        $globalPermission = $globalAliases[$permission] ?? $permission;
+        if (!empty($globalPermissions[$globalPermission])) {
+            return true;
+        }
+    }
+
+    $membership = getProjectMembership($projectId, (int)$user['id']);
+    return $membership !== null && membershipAllows($membership, $permission);
 }
 
 function canViewProject(int $projectId): bool
 {
-    $user = getCurrentUser();
-    if (!$user || $projectId <= 0) {
-        return false;
-    }
-
-    if (($user['role'] ?? '') === 'admin') {
-        return true;
-    }
-
-    if (($user['account_type'] ?? 'employee') === 'client') {
-        return false;
-    }
-
-    $permissions = json_decode($user['permissions'] ?? '{}', true) ?: [];
-    if (!empty($permissions['view_all_projects'])) {
-        return true;
-    }
-
-    try {
-        $pdo = getDB();
-        $stmt = $pdo->prepare("
-            SELECT can_view
-            FROM pm_project_access
-            WHERE user_id = :uid AND project_id = :pid
-            LIMIT 1
-        ");
-        $stmt->execute([
-            'uid' => (int)$user['id'],
-            'pid' => $projectId
-        ]);
-
-        return (int)$stmt->fetchColumn() === 1;
-    } catch (Throwable $e) {
-        return false;
-    }
+    return canDoOnProjectPermission($projectId, 'view_project');
 }
 
-/**
- * Valid actions: view, edit, delete, print, pdf, files.
- */
+/** Valid actions retained for legacy endpoints. */
 function canDoOnProject(int $projectId, string $action): bool
 {
-    if ($action === 'view') {
-        return canViewProject($projectId);
-    }
+    $map = [
+        'view' => 'view_project',
+        'edit' => 'edit_project',
+        'delete' => 'delete_project',
+        'print' => 'print_reports',
+        'pdf' => 'download_reports',
+        'files' => 'view_files',
+    ];
 
-    $allowedActions = ['edit', 'delete', 'print', 'pdf', 'files'];
-    if (!in_array($action, $allowedActions, true)) {
-        return false;
-    }
+    return isset($map[$action]) && canDoOnProjectPermission($projectId, $map[$action]);
+}
 
-    $user = getCurrentUser();
-    if (!$user || $projectId <= 0 || !canViewProject($projectId)) {
-        return false;
-    }
-
-    if (($user['role'] ?? '') === 'admin') {
-        return true;
-    }
-
-    $permissions = json_decode($user['permissions'] ?? '{}', true) ?: [];
-    if (!empty($permissions['view_all_projects'])) {
-        return !empty($permissions[$action]);
-    }
-
-    try {
-        $pdo = getDB();
-        $column = 'can_' . $action;
-        $stmt = $pdo->prepare("
-            SELECT {$column}
-            FROM pm_project_access
-            WHERE user_id = :uid AND project_id = :pid
-            LIMIT 1
-        ");
-        $stmt->execute([
-            'uid' => (int)$user['id'],
-            'pid' => $projectId
-        ]);
-
-        return (int)$stmt->fetchColumn() === 1;
-    } catch (Throwable $e) {
-        return false;
+function requireProjectPermissionJson(int $projectId, string $permission): void
+{
+    requireLoginJson();
+    if (!canDoOnProjectPermission($projectId, $permission)) {
+        sendAuthJsonError('You do not have permission for this project action', 403);
     }
 }
 
@@ -405,38 +583,42 @@ function requireProjectActionPage(int $projectId, string $action): void
     }
 }
 
-/**
- * Returns project IDs that the current user may view. ['*'] means all.
- */
+/** Returns project IDs the current internal user may view. ['*'] means all. */
 function getAllowedProjectIds(): array
 {
     $user = getCurrentUser();
-    if (!$user) {
+    if (!$user || isClientAccount($user)) {
         return [];
     }
 
-    if (($user['role'] ?? '') === 'admin') {
+    if (isHeadAdmin($user)) {
         return ['*'];
     }
 
-    if (($user['account_type'] ?? 'employee') === 'client') {
-        return [];
-    }
-
-    $permissions = json_decode($user['permissions'] ?? '{}', true) ?: [];
+    $permissions = permissionMap($user['permissions'] ?? '{}');
     if (!empty($permissions['view_all_projects'])) {
         return ['*'];
     }
 
     try {
-        $pdo = getDB();
-        $stmt = $pdo->prepare("
-            SELECT project_id
-            FROM pm_project_access
-            WHERE user_id = :uid AND can_view = 1
+        $stmt = getDB()->prepare("
+            SELECT m.project_id, m.permissions
+            FROM pm_project_members m
+            INNER JOIN pm_projects p ON p.id = m.project_id
+            WHERE m.user_id = :user_id
+              AND m.active = 1
+              AND p.deleted_at = ''
         ");
-        $stmt->execute(['uid' => (int)$user['id']]);
-        return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+        $stmt->execute(['user_id' => (int)$user['id']]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $projectIds = [];
+        foreach ($rows as $row) {
+            if (membershipAllows($row, 'view_project')) {
+                $projectIds[] = (int)$row['project_id'];
+            }
+        }
+        return array_values(array_unique($projectIds));
     } catch (Throwable $e) {
         return [];
     }

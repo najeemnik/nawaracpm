@@ -9,7 +9,7 @@
 
 function dbTableHasColumn(PDO $pdo, string $table, string $column): bool
 {
-    $allowedTables = ['pm_users'];
+    $allowedTables = ['pm_users', 'pm_projects', 'pm_audit_log', 'pm_priorities'];
     if (!in_array($table, $allowedTables, true)) {
         throw new InvalidArgumentException('Unsupported migration table');
     }
@@ -418,6 +418,387 @@ function loginSecurityMigration(PDO $pdo): void
     ");
 }
 
+/**
+ * Phase 2.5 security remediation. This migration is additive: it establishes
+ * archival/version columns, canonical membership compatibility, useful indexes
+ * and database-level guards for future task APIs without deleting legacy data.
+ */
+function securityRemediationMigration(PDO $pdo): void
+{
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'owner_user_id', 'INTEGER NULL');
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'updated_by', 'INTEGER NULL');
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'version', 'INTEGER NOT NULL DEFAULT 1');
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'deleted_at', "TEXT NOT NULL DEFAULT ''");
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'deleted_by', 'INTEGER NULL');
+    dbAddColumnIfMissing($pdo, 'pm_projects', 'deletion_reason', "TEXT NOT NULL DEFAULT ''");
+    dbAddColumnIfMissing($pdo, 'pm_audit_log', 'request_id', "TEXT NOT NULL DEFAULT ''");
+
+    $pdo->exec("
+        CREATE INDEX IF NOT EXISTS idx_pm_projects_active_updated
+            ON pm_projects(deleted_at, updated_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_pm_project_access_project
+            ON pm_project_access(project_id);
+        CREATE INDEX IF NOT EXISTS idx_pm_login_attempts_attempted_at
+            ON pm_login_attempts(attempted_at);
+    ");
+
+    // The legacy access table remains a compatibility mirror only. Prevent any
+    // new orphan rows while preserving legacy data for operator-led review.
+    $pdo->exec("
+        CREATE TRIGGER IF NOT EXISTS trg_pm_project_access_valid_insert
+        BEFORE INSERT ON pm_project_access
+        FOR EACH ROW
+        WHEN NOT EXISTS (SELECT 1 FROM pm_users WHERE id = NEW.user_id)
+          OR NOT EXISTS (SELECT 1 FROM pm_projects WHERE id = NEW.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'Project access requires an existing user and project');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_project_access_valid_update
+        BEFORE UPDATE OF user_id, project_id ON pm_project_access
+        FOR EACH ROW
+        WHEN NOT EXISTS (SELECT 1 FROM pm_users WHERE id = NEW.user_id)
+          OR NOT EXISTS (SELECT 1 FROM pm_projects WHERE id = NEW.project_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'Project access requires an existing user and project');
+        END;
+    ");
+
+    // Add canonical legacy permissions to memberships created by migration 002.
+    // This does not overwrite a project-specific permission that was already
+    // deliberately set in pm_project_members.
+    $members = $pdo->query("
+        SELECT m.id, m.membership_role, m.permissions,
+               a.can_view, a.can_edit, a.can_delete, a.can_print, a.can_pdf, a.can_files
+        FROM pm_project_members m
+        LEFT JOIN pm_project_access a
+          ON a.project_id = m.project_id AND a.user_id = m.user_id
+    ")->fetchAll(PDO::FETCH_ASSOC);
+    $updateMember = $pdo->prepare("
+        UPDATE pm_project_members
+        SET permissions = :permissions, updated_at = datetime('now','localtime')
+        WHERE id = :id
+    ");
+    foreach ($members as $member) {
+        $permissions = json_decode((string)($member['permissions'] ?? '{}'), true);
+        if (!is_array($permissions)) {
+            $permissions = [];
+        }
+        if ($member['can_view'] !== null) {
+            $permissions['view_project'] = (int)$member['can_view'] === 1;
+            $permissions['edit_project'] = (int)$member['can_edit'] === 1;
+            $permissions['delete_project'] = (int)$member['can_delete'] === 1;
+            $permissions['print_reports'] = (int)$member['can_print'] === 1;
+            $permissions['download_reports'] = (int)$member['can_pdf'] === 1;
+            $permissions['view_files'] = (int)$member['can_files'] === 1;
+            $permissions['manage_files'] = (int)$member['can_files'] === 1;
+        } elseif (($member['membership_role'] ?? '') !== 'client') {
+            $permissions['view_project'] = $permissions['view_project'] ?? true;
+        }
+        $encoded = json_encode($permissions, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($encoded === false) {
+            throw new RuntimeException('Unable to normalize project membership permissions');
+        }
+        $updateMember->execute(['permissions' => $encoded, 'id' => (int)$member['id']]);
+    }
+
+    // Relational invariants for the task foundation. The task API is added in a
+    // later phase, but malformed cross-project objects must be impossible now.
+    $pdo->exec("
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_item_section_insert
+        BEFORE INSERT ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.item_id IS NOT NULL AND (
+            NEW.section_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM pm_section_items
+                WHERE id = NEW.item_id AND section_id = NEW.section_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task item must belong to its task section');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_item_section_update
+        BEFORE UPDATE OF item_id, section_id ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.item_id IS NOT NULL AND (
+            NEW.section_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM pm_section_items
+                WHERE id = NEW.item_id AND section_id = NEW.section_id
+            )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task item must belong to its task section');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_parent_project_insert
+        BEFORE INSERT ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM pm_tasks parent
+            WHERE parent.id = NEW.parent_task_id AND parent.project_id = NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Parent task must belong to the same project');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_parent_project_update
+        BEFORE UPDATE OF parent_task_id, project_id ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.parent_task_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM pm_tasks parent
+            WHERE parent.id = NEW.parent_task_id AND parent.project_id = NEW.project_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Parent task must belong to the same project');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_client_review_insert
+        BEFORE INSERT ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.client_approval_required = 1 AND NEW.review_required <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'Client approval requires internal review');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_tasks_client_review_update
+        BEFORE UPDATE OF client_approval_required, review_required ON pm_tasks
+        FOR EACH ROW
+        WHEN NEW.client_approval_required = 1 AND NEW.review_required <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'Client approval requires internal review');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_assignees_member_insert
+        BEFORE INSERT ON pm_task_assignees
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM pm_tasks t
+            INNER JOIN pm_users u ON u.id = NEW.user_id AND u.active = 1
+            WHERE t.id = NEW.task_id
+              AND (
+                u.role = 'admin' OR EXISTS (
+                    SELECT 1 FROM pm_project_members m
+                    WHERE m.project_id = t.project_id AND m.user_id = NEW.user_id
+                      AND m.active = 1 AND m.membership_role IN ('project_admin', 'employee')
+                )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task assignee must be an active internal project member');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_assignees_member_update
+        BEFORE UPDATE OF task_id, user_id ON pm_task_assignees
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM pm_tasks t
+            INNER JOIN pm_users u ON u.id = NEW.user_id AND u.active = 1
+            WHERE t.id = NEW.task_id
+              AND (
+                u.role = 'admin' OR EXISTS (
+                    SELECT 1 FROM pm_project_members m
+                    WHERE m.project_id = t.project_id AND m.user_id = NEW.user_id
+                      AND m.active = 1 AND m.membership_role IN ('project_admin', 'employee')
+                )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task assignee must be an active internal project member');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_reviewers_member_insert
+        BEFORE INSERT ON pm_task_reviewers
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM pm_tasks t
+            INNER JOIN pm_users u ON u.id = NEW.user_id AND u.active = 1
+            WHERE t.id = NEW.task_id
+              AND (
+                u.role = 'admin' OR EXISTS (
+                    SELECT 1 FROM pm_project_members m
+                    WHERE m.project_id = t.project_id AND m.user_id = NEW.user_id
+                      AND m.active = 1 AND m.membership_role IN ('project_admin', 'employee')
+                )
+              )
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task reviewer must be an active internal project member');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_client_recipients_member_insert
+        BEFORE INSERT ON pm_task_client_recipients
+        FOR EACH ROW
+        WHEN NOT EXISTS (
+            SELECT 1
+            FROM pm_tasks t
+            INNER JOIN pm_users u ON u.id = NEW.user_id
+            INNER JOIN pm_project_members m
+              ON m.project_id = t.project_id AND m.user_id = NEW.user_id
+            WHERE t.id = NEW.task_id
+              AND u.active = 1
+              AND u.account_type = 'client'
+              AND m.active = 1
+              AND m.membership_role = 'client'
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task client recipient must be an active client project member');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_client_comments_published
+        BEFORE INSERT ON pm_task_comments
+        FOR EACH ROW
+        WHEN NEW.visibility = 'client' AND NOT EXISTS (
+            SELECT 1 FROM pm_tasks WHERE id = NEW.task_id AND client_visible = 1
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Client-visible comments require a published task');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_dependencies_same_project
+        BEFORE INSERT ON pm_task_dependencies
+        FOR EACH ROW
+        WHEN (SELECT project_id FROM pm_tasks WHERE id = NEW.task_id)
+             <> (SELECT project_id FROM pm_tasks WHERE id = NEW.depends_on_task_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'Task dependencies must remain inside one project');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_task_dependencies_no_cycle
+        BEFORE INSERT ON pm_task_dependencies
+        FOR EACH ROW
+        BEGIN
+            SELECT RAISE(ABORT, 'Task dependency cycle is not allowed')
+            WHERE EXISTS (
+                WITH RECURSIVE dependency_tree(id) AS (
+                    SELECT NEW.depends_on_task_id
+                    UNION
+                    SELECT d.depends_on_task_id
+                    FROM pm_task_dependencies d
+                    INNER JOIN dependency_tree tree ON tree.id = d.task_id
+                )
+                SELECT 1 FROM dependency_tree WHERE id = NEW.task_id
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_users_keep_last_admin_on_update
+        BEFORE UPDATE OF role, active ON pm_users
+        FOR EACH ROW
+        WHEN OLD.role = 'admin' AND OLD.active = 1
+          AND (NEW.role <> 'admin' OR NEW.active <> 1)
+          AND (SELECT COUNT(*) FROM pm_users WHERE role = 'admin' AND active = 1) <= 1
+        BEGIN
+            SELECT RAISE(ABORT, 'The last active admin cannot lose access');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_users_keep_last_admin_on_delete
+        BEFORE DELETE ON pm_users
+        FOR EACH ROW
+        WHEN OLD.role = 'admin' AND OLD.active = 1
+          AND (SELECT COUNT(*) FROM pm_users WHERE role = 'admin' AND active = 1) <= 1
+        BEGIN
+            SELECT RAISE(ABORT, 'The last active admin cannot be deleted');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_audit_log_append_only_update
+        BEFORE UPDATE ON pm_audit_log
+        FOR EACH ROW
+        BEGIN
+            SELECT RAISE(ABORT, 'Audit log is append-only');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_audit_log_append_only_delete
+        BEFORE DELETE ON pm_audit_log
+        FOR EACH ROW
+        BEGIN
+            SELECT RAISE(ABORT, 'Audit log is append-only');
+        END;
+    ");
+}
+
+/**
+ * The legacy priority board remains available, but its data lifecycle must be
+ * explicit and auditable rather than created ad hoc by a web request.
+ */
+function prioritiesIntegrityMigration(PDO $pdo): void
+{
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS pm_priorities (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            assignee_id INTEGER NULL,
+            priority TEXT NOT NULL DEFAULT 'medium'
+                CHECK(priority IN ('critical','high','medium','low')),
+            is_done INTEGER NOT NULL DEFAULT 0 CHECK(is_done IN (0,1)),
+            due_date TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            completed_at TEXT NOT NULL DEFAULT '',
+            created_by INTEGER NULL,
+            updated_by INTEGER NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            version INTEGER NOT NULL DEFAULT 1,
+            deleted_at TEXT NOT NULL DEFAULT '',
+            deleted_by INTEGER NULL,
+            FOREIGN KEY(assignee_id) REFERENCES pm_engineers(id) ON DELETE SET NULL,
+            FOREIGN KEY(created_by) REFERENCES pm_users(id) ON DELETE SET NULL,
+            FOREIGN KEY(updated_by) REFERENCES pm_users(id) ON DELETE SET NULL,
+            FOREIGN KEY(deleted_by) REFERENCES pm_users(id) ON DELETE SET NULL
+        );
+    ");
+
+    // Existing priority boards predate migrations, so preserve all rows while
+    // adding provenance and archive metadata in place.
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'created_by', 'INTEGER NULL');
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'updated_by', 'INTEGER NULL');
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'updated_at', "TEXT NOT NULL DEFAULT ''");
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'version', 'INTEGER NOT NULL DEFAULT 1');
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'deleted_at', "TEXT NOT NULL DEFAULT ''");
+    dbAddColumnIfMissing($pdo, 'pm_priorities', 'deleted_by', 'INTEGER NULL');
+
+    $pdo->exec("
+        UPDATE pm_priorities
+        SET updated_at = created_at
+        WHERE updated_at = '';
+
+        UPDATE pm_priorities
+        SET version = 1
+        WHERE version IS NULL OR version < 1;
+
+        CREATE INDEX IF NOT EXISTS idx_pm_priorities_active_board
+            ON pm_priorities(deleted_at, is_done, priority, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_pm_priorities_assignee_active
+            ON pm_priorities(assignee_id, deleted_at, is_done);
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_priorities_assignee_insert
+        BEFORE INSERT ON pm_priorities
+        FOR EACH ROW
+        WHEN NEW.assignee_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM pm_engineers WHERE id = NEW.assignee_id AND active = 1)
+        BEGIN
+            SELECT RAISE(ABORT, 'Priority assignee must be an active engineer');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_priorities_assignee_update
+        BEFORE UPDATE OF assignee_id ON pm_priorities
+        FOR EACH ROW
+        WHEN NEW.assignee_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM pm_engineers WHERE id = NEW.assignee_id AND active = 1)
+        BEGIN
+            SELECT RAISE(ABORT, 'Priority assignee must be an active engineer');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_pm_priorities_archive_only_delete
+        BEFORE DELETE ON pm_priorities
+        FOR EACH ROW
+        BEGIN
+            SELECT RAISE(ABORT, 'Priorities must be archived instead of physically deleted');
+        END;
+    ");
+}
+
 function getDatabaseMigrations(): array
 {
     return [
@@ -445,6 +826,8 @@ function getDatabaseMigrations(): array
         '20261008_004_audit_foundation' => 'auditFoundationMigration',
         '20261008_005_login_security' => 'loginSecurityMigration',
         '20261008_006_task_attachment_foundation' => 'taskAttachmentFoundationMigration',
+        '20261008_007_security_design_remediation' => 'securityRemediationMigration',
+        '20261008_008_priorities_integrity' => 'prioritiesIntegrityMigration',
     ];
 }
 

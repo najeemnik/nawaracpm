@@ -29,8 +29,44 @@ if (isClientAccount($currentUser)) {
 try {
     $pdo = getDB();
 
-    // Meta
+    // Archive review and restore are deliberately a Head Admin lifecycle
+    // workflow. Archived projects stay invisible to ordinary project lists.
+    if (isset($_GET['archived'])) {
+        if ((string)$_GET['archived'] !== '1' || isset($_GET['id']) || isset($_GET['meta'])) {
+            jsonOut(['error' => 'Invalid archive request'], 400);
+        }
+        requireAdminJson();
+        $search = trim((string)($_GET['search'] ?? ''));
+        if (strlen($search) > 200) {
+            jsonOut(['error' => 'Search is too long'], 422);
+        }
+        $params = [];
+        $whereSearch = '';
+        if ($search !== '') {
+            $whereSearch = ' AND (p.project_name LIKE :search OR p.client_name LIKE :search OR p.zone LIKE :search)';
+            $params['search'] = '%' . $search . '%';
+        }
+        $stmt = $pdo->prepare("
+            SELECT p.id, p.project_name, p.client_name, p.zone, p.deleted_at,
+                   p.deletion_reason, p.version, p.updated_at,
+                   u.name AS deleted_by_name
+            FROM pm_projects p
+            LEFT JOIN pm_users u ON u.id = p.deleted_by
+            WHERE p.deleted_at <> '' {$whereSearch}
+            ORDER BY p.deleted_at DESC, p.id DESC
+            LIMIT 500
+        ");
+        $stmt->execute($params);
+        jsonOut(['success' => true, 'projects' => $stmt->fetchAll()]);
+    }
+
+    // Global template metadata is available only to internal users with at
+    // least one authorized project (or a global project-management privilege).
     if (isset($_GET['meta'])) {
+        $allowedForMeta = getAllowedProjectIds();
+        if ($allowedForMeta === [] && !canDo('settings') && !canDo('add')) {
+            jsonOut(['error' => 'You do not have permission to view project metadata'], 403);
+        }
         jsonOut([
             'success' => true,
             'meta' => fetchMeta($pdo)
@@ -71,7 +107,10 @@ try {
         $whereAccess = ' AND p.id IN (' . implode(',', array_map('intval', $allowedProjectIds)) . ')';
     }
 
-    $search = trim($_GET['search'] ?? '');
+    $search = trim((string)($_GET['search'] ?? ''));
+    if (strlen($search) > 200) {
+        jsonOut(['error' => 'Search is too long'], 422);
+    }
 
     if ($search !== '') {
         $like = '%' . $search . '%';
@@ -79,7 +118,8 @@ try {
             SELECT p.*, e.name AS lead_engineer_name
             FROM pm_projects p
             LEFT JOIN pm_engineers e ON e.id = p.lead_engineer_id
-            WHERE (p.project_name LIKE :s1
+            WHERE p.deleted_at = ''
+              AND (p.project_name LIKE :s1
                 OR p.client_name LIKE :s2
                 OR p.zone LIKE :s3)
                 $whereAccess
@@ -91,7 +131,7 @@ try {
             SELECT p.*, e.name AS lead_engineer_name
             FROM pm_projects p
             LEFT JOIN pm_engineers e ON e.id = p.lead_engineer_id
-            WHERE 1=1 $whereAccess
+            WHERE p.deleted_at = '' $whereAccess
             ORDER BY p.updated_at DESC, p.id DESC
         ");
         $stmt->execute();
@@ -121,54 +161,19 @@ try {
  */
 function getUserAccessForProject($pdo, $projectId) {
     $user = function_exists('getCurrentUser') ? getCurrentUser() : null;
-    
+
     if (!$user || isClientAccount($user)) {
         return ['view'=>false, 'edit'=>false, 'delete'=>false, 'print'=>false, 'pdf'=>false, 'files'=>false];
     }
-    
-    // Admin همه چیز
-    if (($user['role'] ?? '') === 'admin') {
-        return ['view'=>true, 'edit'=>true, 'delete'=>true, 'print'=>true, 'pdf'=>true, 'files'=>true];
-    }
-    
-    $perms = json_decode($user['permissions'] ?? '{}', true) ?: [];
-    $viewAll = !empty($perms['view_all_projects']);
-    
-    if ($viewAll) {
-        // از general permissions استفاده کن
-        return [
-            'view' => true,
-            'edit' => !empty($perms['edit']),
-            'delete' => !empty($perms['delete']),
-            'print' => !empty($perms['print']),
-            'pdf' => !empty($perms['pdf']),
-            'files' => !empty($perms['files'])
-        ];
-    }
-    
-    // project-specific access
-    try {
-        $stmt = $pdo->prepare("
-            SELECT can_view, can_edit, can_delete, can_print, can_pdf, can_files
-            FROM pm_project_access 
-            WHERE user_id = :uid AND project_id = :pid LIMIT 1
-        ");
-        $stmt->execute(['uid' => $user['id'], 'pid' => $projectId]);
-        $access = $stmt->fetch();
-        
-        if (!$access) {
-            return ['view'=>false, 'edit'=>false, 'delete'=>false, 'print'=>false, 'pdf'=>false, 'files'=>false];
-        }
-        
-        return [
-            'view' => (bool)$access['can_view'],
-            'edit' => (bool)$access['can_edit'],
-            'delete' => (bool)$access['can_delete'],
-            'print' => (bool)$access['can_print'],
-            'pdf' => (bool)$access['can_pdf'],
-            'files' => (bool)$access['can_files']
-        ];
-    } catch (Throwable $e) {
-        return ['view'=>false, 'edit'=>false, 'delete'=>false, 'print'=>false, 'pdf'=>false, 'files'=>false];
-    }
+
+    // Always ask the canonical membership resolver. Legacy pm_project_access
+    // is never used to make an authorization decision here.
+    return [
+        'view' => canDoOnProject((int)$projectId, 'view'),
+        'edit' => canDoOnProject((int)$projectId, 'edit'),
+        'delete' => canDoOnProject((int)$projectId, 'delete'),
+        'print' => canDoOnProject((int)$projectId, 'print'),
+        'pdf' => canDoOnProject((int)$projectId, 'pdf'),
+        'files' => canDoOnProject((int)$projectId, 'files')
+    ];
 }

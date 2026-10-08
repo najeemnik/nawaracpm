@@ -45,15 +45,60 @@ function normalizeUserPermissions($permissions): array
     return $normalized;
 }
 
+function membershipPermissionsFromUserPermissions(array $permissions, string $accountType): array
+{
+    if ($accountType === 'client') {
+        return [
+            'view_client_summary' => true,
+            'view_published_reports' => false,
+            'view_published_files' => false,
+            'view_published_timeline' => false,
+            'comment_on_published_items' => false,
+            'approve_client_deliverables' => false,
+        ];
+    }
+
+    return [
+        'view_project' => true,
+        'edit_project' => !empty($permissions['edit']),
+        'delete_project' => !empty($permissions['delete']),
+        'print_reports' => !empty($permissions['print']),
+        'download_reports' => !empty($permissions['pdf']),
+        'view_files' => !empty($permissions['files']),
+        'manage_files' => !empty($permissions['files']),
+        // Task permissions start deny-by-default and are granted only by the
+        // dedicated task/member management API in the next implementation stage.
+        'view_internal_tasks' => false,
+        'create_tasks' => false,
+        'edit_tasks' => false,
+        'assign_tasks' => false,
+        'update_own_assignment' => false,
+        'update_any_task' => false,
+        'submit_for_review' => false,
+        'review_tasks' => false,
+        'approve_tasks' => false,
+        'request_revision' => false,
+        'upload_files' => !empty($permissions['files']),
+        'publish_files_to_client' => false,
+        'manage_client_access' => false,
+    ];
+}
+
 function fetchExistingProjectIds(PDO $pdo, array $projectIds): array
 {
     $ids = array_values(array_unique(array_filter(array_map('intval', $projectIds), static fn($id) => $id > 0)));
     if ($ids === []) {
         return [];
     }
+    if (count($ids) > 500) {
+        // The caller returns a validation response before reaching this guard.
+        return [];
+    }
 
     $placeholders = implode(',', array_fill(0, count($ids), '?'));
-    $stmt = $pdo->prepare("SELECT id FROM pm_projects WHERE id IN ({$placeholders})");
+    // Archived projects deliberately cannot gain new access grants. Their
+    // historical membership remains intact for a future restore operation.
+    $stmt = $pdo->prepare("SELECT id FROM pm_projects WHERE deleted_at = '' AND id IN ({$placeholders})");
     $stmt->execute($ids);
 
     return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
@@ -99,6 +144,10 @@ try {
         }
         if ($role === 'admin') {
             $accountType = 'admin';
+        } elseif ($accountType === 'admin') {
+            // An account-type label must never be usable to imply a global
+            // role. Head Admin authority is role=admin only.
+            $accountType = 'employee';
         }
 
         $permissions = normalizeUserPermissions($input['permissions'] ?? []);
@@ -144,6 +193,9 @@ try {
         $requestedProjectIds = is_array($projectAccess)
             ? array_values(array_unique(array_filter(array_map('intval', $projectAccess), static fn($projectId) => $projectId > 0)))
             : [];
+        if (count($requestedProjectIds) > 500) {
+            usersOut(['success' => false, 'error' => 'Too many project assignments'], 422);
+        }
         $validProjectIds = fetchExistingProjectIds($pdo, $requestedProjectIds);
         if ($projectAccessProvided && count($validProjectIds) !== count($requestedProjectIds)) {
             usersOut(['success' => false, 'error' => 'One or more selected projects do not exist'], 422);
@@ -197,6 +249,13 @@ try {
             $membershipRole = $accountType === 'client'
                 ? 'client'
                 : ($role === 'admin' ? 'project_admin' : 'employee');
+            $membershipPermissionsJson = json_encode(
+                membershipPermissionsFromUserPermissions($permissions, $accountType),
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+            );
+            if ($membershipPermissionsJson === false) {
+                throw new RuntimeException('Unable to encode project membership permissions');
+            }
 
             // An update that does not explicitly include project_access keeps
             // its existing assignments. An explicit [] intentionally clears it.
@@ -235,7 +294,7 @@ try {
                         $projectId,
                         $userId,
                         $membershipRole,
-                        $permissionsJson,
+                        $membershipPermissionsJson,
                         $createdBy
                     ]);
                 }
@@ -258,7 +317,7 @@ try {
                     UPDATE pm_project_members
                     SET membership_role = ?, permissions = ?, updated_at = datetime('now','localtime')
                     WHERE user_id = ?
-                ")->execute([$membershipRole, $permissionsJson, $userId]);
+                ")->execute([$membershipRole, $membershipPermissionsJson, $userId]);
             }
 
             $pdo->commit();
@@ -296,32 +355,37 @@ try {
         $projects = $pdo->query("
             SELECT id, project_name, client_name
             FROM pm_projects
+            WHERE deleted_at = ''
             ORDER BY project_name ASC
         ")->fetchAll();
 
-        $stmt = $pdo->prepare('SELECT * FROM pm_project_access WHERE user_id = ?');
+        $stmt = $pdo->prepare("
+            SELECT project_id, permissions, active
+            FROM pm_project_members
+            WHERE user_id = ? AND active = 1
+        ");
         $stmt->execute([$userId]);
-        $accesses = $stmt->fetchAll();
+        $memberships = $stmt->fetchAll();
 
-        $accessMap = [];
-        foreach ($accesses as $access) {
-            $accessMap[(int)$access['project_id']] = $access;
+        $membershipMap = [];
+        foreach ($memberships as $membership) {
+            $membershipMap[(int)$membership['project_id']] = $membership;
         }
 
         $result = [];
         foreach ($projects as $project) {
-            $access = $accessMap[(int)$project['id']] ?? null;
+            $membership = $membershipMap[(int)$project['id']] ?? null;
             $result[] = [
                 'id' => (int)$project['id'],
                 'name' => $project['project_name'],
                 'client' => $project['client_name'],
-                'access' => $access ? [
-                    'view' => (bool)$access['can_view'],
-                    'edit' => (bool)$access['can_edit'],
-                    'delete' => (bool)$access['can_delete'],
-                    'print' => (bool)$access['can_print'],
-                    'pdf' => (bool)$access['can_pdf'],
-                    'files' => (bool)$access['can_files']
+                'access' => $membership ? [
+                    'view' => membershipAllows($membership, 'view_project'),
+                    'edit' => membershipAllows($membership, 'edit_project'),
+                    'delete' => membershipAllows($membership, 'delete_project'),
+                    'print' => membershipAllows($membership, 'print_reports'),
+                    'pdf' => membershipAllows($membership, 'download_reports'),
+                    'files' => membershipAllows($membership, 'view_files')
                 ] : null
             ];
         }

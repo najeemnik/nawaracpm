@@ -1,6 +1,6 @@
 # گزارش امنیتی و عیب‌یابی Database — NawAra CPM
 
-**تاریخ بررسی:** ۷ اکتوبر ۲۰۲۶  
+**تاریخ بررسی:** ۷ اکتوبر ۲۰۲۶
 **وضعیت تغییرات:** این گزارش فقط خواندنی تهیه شده است؛ هیچ داده، schema یا فایل اجرایی تغییر داده نشده است.
 
 > این گزارش همهٔ مواردی را پوشش می‌دهد که با بررسی source code، schema، تنظیمات SQLite و snapshot فعلی database قابل شناسایی بود. این یک security review عمیق است، اما هیچ بررسی نمی‌تواند وجود آسیب‌پذیری ناشناخته در PHP، web server، hosting یا dependencyهای آینده را به‌طور مطلق رد کند.
@@ -49,7 +49,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-01 — Database حساس داخل Web Root و داخل Git است
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `config.php:18–23` مسیر database را `__DIR__/data/database.sqlite` تعیین می‌کند.
@@ -75,7 +75,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-02 — Admin bootstrap با credential ثابت در source code
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:** `database.php:150–169`
 
 وقتی جدول user خالی باشد، code یک Admin پیش‌فرض با username و password معلوم ایجاد می‌کند.
@@ -95,7 +95,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-03 — Authorization سمت server برای عملیات database ناقص است
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `save_project.php:7` فقط login را چک می‌کند؛ actionهای `save_project`، `add_engineer`، `add_status`، `save_engineers`، `save_statuses` و `save_sections` بررسی permission سمت server ندارند.
@@ -125,7 +125,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-04 — File Manager permission bypass و storage ناامن
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `file_manager.php:10–55` project ID را فقط از `$_GET` یا `$_POST` پیش از parse شدن JSON می‌خواند.
@@ -152,7 +152,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-05 — Stored XSS از داده‌های database و file nameها
 
-**وضعیت:** تأییدشده در code review  
+**وضعیت:** تأییدشده در code review
 **شواهد:**
 
 - `script.js:178–214` نام پروژه را داخل inline `onclick` می‌گذارد؛ فقط apostrophe را replace می‌کند و HTML/JavaScript context را امن نمی‌کند.
@@ -178,7 +178,7 @@ Database **خراب (corrupt) نیست**، ولی طراحی و طرز استف�
 
 ### DB-06 — Access table foreign key ندارد و رکورد یتیم واقعاً وجود دارد
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `pm_project_access` در `database.php:133–145` هیچ foreign key به `pm_users` یا `pm_projects` ندارد.
@@ -203,7 +203,7 @@ Foreign keyهای زیر را در migration جدید اضافه کنید:
 
 ### DB-07 — تاریخچهٔ پروژه‌ها با تغییر template از بین می‌رود یا تغییر می‌کند
 
-**وضعیت:** تأییدشده و در data فعلی دیده شد  
+**وضعیت:** تأییدشده و در data فعلی دیده شد
 **شواهد:**
 
 - `save_project.php` هنگام save sectionها همهٔ section/itemهای قبلی را `active=0` می‌کند.
@@ -230,7 +230,7 @@ Foreign keyهای زیر را در migration جدید اضافه کنید:
 
 ### DB-08 — Session پس از حذف user، تغییر password یا revoke permission معتبر می‌ماند
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `config.php:41–46` login را فقط از `$_SESSION` می‌خواند.
@@ -252,7 +252,7 @@ Foreign keyهای زیر را در migration جدید اضافه کنید:
 
 ### DB-09 — Error messageهای database به client افشا می‌شوند
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `config.php:7–10` نمایش تمام errorها را روشن کرده است.
@@ -275,7 +275,7 @@ path سرور، نام جدول/column، SQL error و اطلاعات داخلی 
 
 ### DB-10 — Schema constraints ضعیف؛ database خودش از دادهٔ بد محافظت نمی‌کند
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **موارد:**
 
 - `pm_users.role` CHECK ندارد.
@@ -308,7 +308,7 @@ CHECK constraint، validation سمت server و migration اضافه شود. مث
 
 ### DB-11 — Progress یک cache بدون trigger است و می‌تواند stale شود
 
-**وضعیت:** تأییدشده در design؛ مقدار فعلی درست است  
+**وضعیت:** تأییدشده در design؛ مقدار فعلی درست است
 **شواهد:**
 
 - `pm_projects.progress` ذخیره می‌شود، اما trigger database برای update آن وجود ندارد.
@@ -330,7 +330,7 @@ CHECK constraint، validation سمت server و migration اضافه شود. مث
 
 ### DB-12 — File metadata legacy و disk state از database جدا است
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - جدول `project_files` در database وجود دارد و index هم دارد.
@@ -352,7 +352,7 @@ metadata قدیمی، file واقعی و permissionها از هم جدا می‌
 
 ### DB-13 — بدون audit log، owner و version برای data حساس
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **اثر:**
 
 هیچ جدول audit برای این تغییرات وجود ندارد:
@@ -376,7 +376,7 @@ metadata قدیمی، file واقعی و permissionها از هم جدا می‌
 
 ### DB-14 — CSRF، cookie hardening و session fixation کامل نیست
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - CSRF token یا Origin/Referer validation در write endpointها نیست.
@@ -395,7 +395,7 @@ HTTPS اجباری، cookie Secure، CSRF token برای تمام mutationها،
 
 ### DB-15 — project access model ownership ندارد
 
-**وضعیت:** تأییدشده در model  
+**وضعیت:** تأییدشده در model
 
 Userی که `add` دارد ولی `view_all_projects` ندارد، پس از ایجاد پروژه ممکن است access row برای پروژهٔ تازه نداشته باشد و نتواند پروژهٔ خودش را ببیند. Database هم owner/create-user برای project ندارد.
 
@@ -409,7 +409,7 @@ Userی که `add` دارد ولی `view_all_projects` ندارد، پس از ا�
 
 ### DB-16 — Database migration/versioning وجود ندارد؛ schema drift اتفاق افتاده است
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 **شواهد:**
 
 - `PRAGMA user_version` برابر ۰ است.
@@ -431,7 +431,7 @@ Migration versioned بسازید؛ مثلاً migrationهای شماره‌دا�
 
 ### DB-17 — SQLite/WAL backup و concurrency plan ندارد
 
-**وضعیت:** خطر عملیاتی تأییدشده  
+**وضعیت:** خطر عملیاتی تأییدشده
 **شواهد:**
 
 - برنامه WAL را فعال می‌کند (`database.php:26–27`).
@@ -456,7 +456,7 @@ Copy کردن فقط `database.sqlite` در زمان active بودن WAL ممک�
 
 ### DB-18 — Index و query plan برای رشد داده مناسب نیست
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 
 `EXPLAIN QUERY PLAN` نشان داد:
 
@@ -479,7 +479,7 @@ Copy کردن فقط `database.sqlite` در زمان active بودن WAL ممک�
 
 ### DB-19 — Validation طول متن، date و حجم داده محدود نیست
 
-**وضعیت:** تأییدشده  
+**وضعیت:** تأییدشده
 
 اکنون داده‌های فعلی طول کوتاه و فرمت درست دارند، اما schema و endpointها حد بالای قابل اتکا برای project name، description، comment، priority title، username، filename یا JSON payload ندارند.
 
@@ -501,7 +501,7 @@ Database bloat، کندی، responseهای بزرگ، XSS surface بزرگ‌ت�
 
 ### DB-20 — Date/time به شکل TEXT و local time ذخیره می‌شود
 
-**وضعیت:** design risk  
+**وضعیت:** design risk
 
 برنامه از `datetime('now','localtime')` و stringهای `Y-m-d` / `Y-m-dTH:i` استفاده می‌کند. timezone field، UTC standard و validation database وجود ندارد.
 
@@ -517,7 +517,7 @@ UTC را در database ذخیره کنید، timezone display را در UI ان�
 
 ### DB-21 — Encryption at rest و server hardening خارج از database تعریف نشده
 
-**وضعیت:** خطر deployment  
+**وضعیت:** خطر deployment
 
 SQLite به‌صورت عادی plaintext است. در این repository encryption layer، key management، volume encryption policy یا access isolation تعریف نشده است. چون DB داخل web root و با permission باز قرار دارد، این مورد در این پروژه اهمیت بسیار بالا پیدا می‌کند.
 

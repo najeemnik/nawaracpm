@@ -7,6 +7,36 @@
 require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/migrations.php';
 
+/**
+ * Read-only readiness check used when production schema changes have not been
+ * explicitly approved. It deliberately performs no CREATE/ALTER/INSERT work.
+ */
+function databaseSchemaIsCurrent(PDO $pdo): bool
+{
+    try {
+        $ledgerExists = (bool)$pdo->query("
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'pm_schema_migrations'
+            LIMIT 1
+        ")->fetchColumn();
+        if (!$ledgerExists) {
+            return false;
+        }
+
+        $applied = $pdo->query('SELECT migration_id FROM pm_schema_migrations')->fetchAll(PDO::FETCH_COLUMN);
+        $appliedMap = array_fill_keys(array_map('strval', $applied), true);
+        foreach (array_keys(getDatabaseMigrations()) as $migrationId) {
+            if (!isset($appliedMap[$migrationId])) {
+                return false;
+            }
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
+
 function getDB(): PDO
 {
     static $pdo = null;
@@ -16,21 +46,48 @@ function getDB(): PDO
     }
 
     $dir = dirname(DB_PATH);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        nawaraConfigurationError('Private database directory is unavailable');
     }
 
+    // Calculate this before opening SQLite: an unapproved fresh production
+    // deployment must not even create a new database file implicitly.
+    $allowSchemaWrites = APP_ENV !== 'production'
+        || in_array(strtolower((string)(getenv('NAWARA_ALLOW_SCHEMA_MIGRATIONS') ?: '')), ['1', 'true', 'yes'], true);
+
     try {
+        if (!$allowSchemaWrites && !is_file(DB_PATH)) {
+            throw new RuntimeException('Database schema migration is required before creating the production database.');
+        }
         $pdo = new PDO('sqlite:' . DB_PATH);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+        // Production schema writes are opt-in. Check the migration ledger
+        // before executing any write-capable SQLite pragma or chmod operation,
+        // so an unapproved deployment remains read-only with respect to the
+        // authoritative database.
+        if (!$allowSchemaWrites && !databaseSchemaIsCurrent($pdo)) {
+            throw new RuntimeException(
+                'Database schema migration is required. Verify a backup and set NAWARA_ALLOW_SCHEMA_MIGRATIONS=1 for the approved migration run.'
+            );
+        }
+
         $pdo->exec('PRAGMA foreign_keys = ON');
         $pdo->exec('PRAGMA journal_mode = WAL');
         $pdo->exec('PRAGMA busy_timeout = 5000');
+        $pdo->exec('PRAGMA secure_delete = ON');
+        $pdo->exec('PRAGMA trusted_schema = OFF');
+        $pdo->exec('PRAGMA recursive_triggers = ON');
+        if (file_exists(DB_PATH)) {
+            @chmod(DB_PATH, 0640);
+        }
 
-        createTables($pdo);
-        runDatabaseMigrations($pdo);
-        seedDefaultData($pdo);
+        if ($allowSchemaWrites) {
+            createTables($pdo);
+            runDatabaseMigrations($pdo);
+            seedDefaultData($pdo);
+        }
 
         return $pdo;
     } catch (Throwable $e) {
@@ -153,33 +210,29 @@ function createTables(PDO $pdo): void
 
 function seedDefaultData(PDO $pdo): void
 {
-    // ساخت ادمین پیش‌فرض اگر کاربری وجود نداشت
-    try {
-        $userCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users")->fetchColumn();
-        if ($userCount === 0) {
-            $initialPassword = (string)(getenv('NAWARA_INITIAL_ADMIN_PASSWORD') ?: '');
-            if (strlen($initialPassword) < 12) {
-                $initialPassword = bin2hex(random_bytes(16));
-                error_log('NawAra created the initial admin account. Set its password immediately. Temporary password: ' . $initialPassword);
-            }
-
-            $stmt = $pdo->prepare("
-                INSERT INTO pm_users
-                    (name, username, password, role, account_type, permissions, auth_version, password_changed_at, updated_at)
-                VALUES
-                    (:name, :username, :password, :role, 'admin', :permissions, 1,
-                     datetime('now','localtime'), datetime('now','localtime'))
-            ");
-            $stmt->execute([
-                'name' => 'Administrator',
-                'username' => 'admin',
-                'password' => password_hash($initialPassword, PASSWORD_DEFAULT),
-                'role' => 'admin',
-                'permissions' => '{}'
-            ]);
+    // A fresh install must receive its bootstrap secret through the deployment
+    // environment. Never generate and leak an administrator password in logs.
+    $userCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users")->fetchColumn();
+    if ($userCount === 0) {
+        $initialPassword = (string)(getenv('NAWARA_INITIAL_ADMIN_PASSWORD') ?: '');
+        if (strlen($initialPassword) < 12) {
+            throw new RuntimeException('NAWARA_INITIAL_ADMIN_PASSWORD must be set to a password of at least 12 characters before first startup');
         }
-    } catch (Throwable $e) {
-        // Ignore
+
+        $stmt = $pdo->prepare("
+            INSERT INTO pm_users
+                (name, username, password, role, account_type, permissions, auth_version, password_changed_at, updated_at)
+            VALUES
+                (:name, :username, :password, :role, 'admin', :permissions, 1,
+                 datetime('now','localtime'), datetime('now','localtime'))
+        ");
+        $stmt->execute([
+            'name' => 'Administrator',
+            'username' => 'admin',
+            'password' => password_hash($initialPassword, PASSWORD_DEFAULT),
+            'role' => 'admin',
+            'permissions' => '{}'
+        ]);
     }
 
     // Status های پیش‌فرض
@@ -490,7 +543,7 @@ function getProjectPayload(PDO $pdo, int $id): ?array
         SELECT p.*, e.name AS lead_engineer_name
         FROM pm_projects p
         LEFT JOIN pm_engineers e ON e.id = p.lead_engineer_id
-        WHERE p.id = :id
+        WHERE p.id = :id AND p.deleted_at = ''
         LIMIT 1
     ");
     $stmt->execute(['id' => $id]);

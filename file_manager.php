@@ -77,18 +77,22 @@ if ($projectId <= 0) {
     fm_json(['success' => false, 'error' => 'Invalid project ID'], 400);
 }
 
-if (!canViewProject($projectId) || !canDoOnProject($projectId, 'files')) {
+$requiredProjectPermission = in_array($action, ['create_folder', 'upload', 'rename', 'delete'], true)
+    ? 'manage_files'
+    : 'view_files';
+if (!canDoOnProjectPermission($projectId, $requiredProjectPermission)) {
     fm_access_denied($action);
 }
 
-$configuredUploadsDir = trim((string)(getenv('NAWARA_UPLOADS_DIR') ?: ''));
-$uploadsDir = $configuredUploadsDir !== ''
-    ? rtrim($configuredUploadsDir, DIRECTORY_SEPARATOR)
-    : __DIR__ . '/uploads';
-define('FM_BASE_DIR', $uploadsDir);
+// APP_UPLOADS_DIR is resolved centrally by config.php. In production it is
+// required to live outside the web root; this endpoint never supplies a local
+// fallback of its own.
+define('FM_BASE_DIR', APP_UPLOADS_DIR);
 define('FM_MAX_UPLOAD_SIZE', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_MB') ?: 50)) * 1024 * 1024);
 define('FM_MAX_UPLOAD_FILES', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_FILES') ?: 10)));
 define('FM_MAX_UPLOAD_TOTAL_SIZE', max(1, (int)(getenv('NAWARA_MAX_UPLOAD_TOTAL_MB') ?: 100)) * 1024 * 1024);
+define('FM_MAX_PROJECT_STORAGE', max(1, (int)(getenv('NAWARA_MAX_PROJECT_UPLOAD_MB') ?: 500)) * 1024 * 1024);
+define('FM_MAX_PROJECT_FILE_COUNT', max(1, (int)(getenv('NAWARA_MAX_PROJECT_UPLOAD_FILES') ?: 5000)));
 
 define('FM_ALLOWED_EXTENSIONS', [
     'pdf', 'doc', 'docx', 'xls', 'xlsx', 'csv', 'txt',
@@ -110,7 +114,7 @@ function fm_table_exists(PDO $pdo, string $table): bool
 function fm_project_exists(PDO $pdo, int $projectId): bool
 {
     if (fm_table_exists($pdo, 'pm_projects')) {
-        $stmt = $pdo->prepare("SELECT id FROM pm_projects WHERE id=:id LIMIT 1");
+        $stmt = $pdo->prepare("SELECT id FROM pm_projects WHERE id=:id AND deleted_at = '' LIMIT 1");
         $stmt->execute(['id' => $projectId]);
         if ($stmt->fetch()) return true;
     }
@@ -148,13 +152,13 @@ function fm_ensure_default_folders(int $projectId): void
     $root = fm_project_root($projectId);
 
     if (!is_dir($root)) {
-        @mkdir($root, 0755, true);
+        @mkdir($root, 0750, true);
     }
 
     foreach (fm_default_folders() as $folder) {
         $path = $root . '/' . $folder;
         if (!is_dir($path)) {
-            @mkdir($path, 0755, true);
+            @mkdir($path, 0750, true);
         }
     }
 }
@@ -166,12 +170,14 @@ function fm_clean_name(string $name): string
         return '';
     }
 
-    // Names are a single path component; do not silently turn a supplied path
-    // into a different file name.
-    if (str_contains($name, '/') || str_contains($name, '\\') || str_contains($name, "\0")) {
+    // A file/folder name is a single logical component, not executable source.
+    // Permit Unicode letters/numbers used by Dari and English users, plus a
+    // deliberately small punctuation set. Contextual output encoding remains
+    // mandatory in the browser even with this allowlist.
+    if (!preg_match('/^[\p{L}\p{N}][\p{L}\p{N} ._()\-]*$/u', $name)) {
         return '';
     }
-    if (preg_match('/[\x00-\x1F\x7F]/', $name)) {
+    if (str_contains($name, '/') || str_contains($name, '\\') || str_contains($name, "\0")) {
         return '';
     }
 
@@ -186,7 +192,7 @@ function fm_path_is_within(string $path, string $root): bool
 function fm_safe_path(int $projectId, string $relative): ?string
 {
     $root = fm_project_root($projectId);
-    if (!is_dir($root) && !@mkdir($root, 0755, true) && !is_dir($root)) {
+    if (!is_dir($root) && !@mkdir($root, 0750, true) && !is_dir($root)) {
         return null;
     }
 
@@ -262,11 +268,73 @@ function fm_ext(string $filename): string
     return strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 }
 
+function fm_directory_usage(string $root): array
+{
+    $bytes = 0;
+    $count = 0;
+    if (!is_dir($root)) {
+        return ['bytes' => 0, 'count' => 0];
+    }
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+    foreach ($iterator as $entry) {
+        if ($entry->isLink() || !$entry->isFile()) {
+            continue;
+        }
+        $bytes += max(0, (int)$entry->getSize());
+        $count++;
+        if ($bytes > FM_MAX_PROJECT_STORAGE || $count > FM_MAX_PROJECT_FILE_COUNT) {
+            break;
+        }
+    }
+
+    return ['bytes' => $bytes, 'count' => $count];
+}
+
+function fm_has_allowed_content(string $tmpFile, string $extension): bool
+{
+    $mime = '';
+    if (class_exists('finfo')) {
+        try {
+            $detected = (new finfo(FILEINFO_MIME_TYPE))->file($tmpFile);
+            $mime = is_string($detected) ? strtolower($detected) : '';
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    // CAD/BIM and archive formats are often reported as application/octet-stream.
+    // For recognizable active formats, require the expected family rather than
+    // trusting only a filename extension.
+    $allowedFamilies = [
+        'pdf' => ['application/pdf'],
+        'jpg' => ['image/jpeg'],
+        'jpeg' => ['image/jpeg'],
+        'png' => ['image/png'],
+        'gif' => ['image/gif'],
+        'webp' => ['image/webp'],
+        'txt' => ['text/plain', 'application/octet-stream'],
+        'csv' => ['text/plain', 'text/csv', 'application/csv', 'application/vnd.ms-excel'],
+        'zip' => ['application/zip', 'application/x-zip-compressed', 'application/octet-stream'],
+        'rar' => ['application/vnd.rar', 'application/x-rar-compressed', 'application/octet-stream'],
+        '7z' => ['application/x-7z-compressed', 'application/octet-stream'],
+    ];
+
+    if ($mime === '' || !isset($allowedFamilies[$extension])) {
+        return true;
+    }
+
+    return in_array($mime, $allowedFamilies[$extension], true);
+}
+
 try {
     $pdo = getDB();
 
     if (!is_dir(FM_BASE_DIR)) {
-        @mkdir(FM_BASE_DIR, 0755, true);
+        @mkdir(FM_BASE_DIR, 0750, true);
     }
 
     /**
@@ -370,7 +438,7 @@ try {
         if ($parent === null) fm_json(['success' => false, 'error' => 'Invalid path'], 400);
 
         if (!is_dir($parent)) {
-            @mkdir($parent, 0755, true);
+            @mkdir($parent, 0750, true);
         }
 
         $newDir = $parent . '/' . $folderName;
@@ -379,7 +447,7 @@ try {
             fm_json(['success' => false, 'error' => 'A file/folder with this name already exists'], 400);
         }
 
-        if (!@mkdir($newDir, 0755, true)) {
+        if (!@mkdir($newDir, 0750, true)) {
             fm_json(['success' => false, 'error' => 'Failed to create folder'], 500);
         }
 
@@ -401,7 +469,7 @@ try {
         $target = fm_safe_path($projectId, $path);
         if ($target === null) fm_json(['success' => false, 'error' => 'Invalid path'], 400);
 
-        if (!is_dir($target)) @mkdir($target, 0755, true);
+        if (!is_dir($target)) @mkdir($target, 0750, true);
         if (!is_writable($target)) fm_json(['success' => false, 'error' => 'Upload folder is not writable'], 500);
 
         $names  = $_FILES['files']['name'];
@@ -418,6 +486,14 @@ try {
         $requestTotalSize = array_sum(array_map('intval', is_array($sizes) ? $sizes : []));
         if ($requestTotalSize > FM_MAX_UPLOAD_TOTAL_SIZE) {
             fm_json(['success' => false, 'error' => 'Total upload size is too large'], 422);
+        }
+
+        $usage = fm_directory_usage(fm_project_root($projectId));
+        if ($usage['bytes'] + $requestTotalSize > FM_MAX_PROJECT_STORAGE) {
+            fm_json(['success' => false, 'error' => 'This project has reached its storage quota'], 422);
+        }
+        if ($usage['count'] + count($names) > FM_MAX_PROJECT_FILE_COUNT) {
+            fm_json(['success' => false, 'error' => 'This project has reached its file-count quota'], 422);
         }
 
         $uploaded = [];
@@ -440,6 +516,10 @@ try {
             }
             if (!is_uploaded_file($tmp)) {
                 $uploadErrors[] = "$original: invalid upload";
+                continue;
+            }
+            if (!fm_has_allowed_content($tmp, $ext)) {
+                $uploadErrors[] = "$original: file content does not match the permitted type";
                 continue;
             }
 

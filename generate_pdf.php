@@ -99,8 +99,8 @@ th{background:#f8fafc;color:#475569;font-size:9px;text-transform:uppercase;}
 <body>
 
 <div class="no-print">
-    <button class="btn btn-primary" onclick="window.print()">Print / Save PDF</button>
-    <button class="btn btn-secondary" onclick="window.close()">Close</button>
+    <button type="button" class="btn btn-primary" data-report-action="print">Print / Save PDF</button>
+    <button type="button" class="btn btn-secondary" data-report-action="close">Close</button>
 </div>
 
 <div class="wrap">
@@ -200,5 +200,6 @@ th{background:#f8fafc;color:#475569;font-size:9px;text-transform:uppercase;}
 
 </div>
 
+<script src="pdf_actions.js?v=<?php echo app_asset_version('pdf_actions.js'); ?>"></script>
 </body>
 </html>

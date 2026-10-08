@@ -236,6 +236,7 @@ body{
 .proj-table tbody tr{transition:var(--t);}
 .proj-table tbody tr:hover{background:#f8fafc;}
 .pname{font-weight:900;cursor:pointer;}
+button.pname{appearance:none;background:transparent;border:0;color:inherit;font:inherit;padding:0;text-align:left;}
 .pname:hover{color:var(--primary);}
 
 .prog-wrap{display:flex;align-items:center;gap:10px;min-width:150px;}
@@ -595,6 +596,13 @@ body{
     border-radius: 8px;
     transition: var(--t);
 }
+button.fm-crumb {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    color: inherit;
+    font: inherit;
+}
 .fm-crumb:hover { background: #c7d2fe; }
 .fm-crumb.current { background: #4f46e5; color: #fff; cursor: default; }
 
@@ -824,6 +832,7 @@ body{
 .pri-task-check {
     width: 34px;
     height: 34px;
+    border: 0;
     border-radius: 10px;
     background: #f1f5f9;
     display: flex;

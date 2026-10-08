@@ -21,6 +21,9 @@ $loginError = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
     $username = trim((string)($_POST['username'] ?? ''));
     $password = (string)($_POST['password'] ?? '');
+    // Bound untrusted credential payloads before bcrypt work and database logs.
+    $username = substr($username, 0, 64);
+    $passwordTooLong = strlen($password) > 1024;
 
     if (!isValidCsrfToken($_POST['csrf_token'] ?? null)) {
         $loginError = 'درخواست نامعتبر است. لطفاً دوباره تلاش کنید.';
@@ -30,11 +33,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
         // not persisted in the login-attempt table.
         $usernameHash = hash('sha256', strtolower($username));
         $ipHash = hash('sha256', (string)($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
-        $pdo->prepare("DELETE FROM pm_login_attempts WHERE attempted_at < datetime('now','-30 days')")->execute();
+        // Avoid a full retention delete on every login. The dedicated index in
+        // migration 007 keeps this bounded maintenance query inexpensive.
+        if (random_int(1, 100) === 1) {
+            $pdo->prepare("DELETE FROM pm_login_attempts WHERE attempted_at < datetime('now','-30 days')")->execute();
+        }
 
         $throttleStmt = $pdo->prepare("
             SELECT
-                SUM(CASE WHEN username_hash = :username_hash THEN 1 ELSE 0 END) AS username_failures,
+                SUM(CASE WHEN username_hash = :username_hash AND ip_hash = :ip_hash THEN 1 ELSE 0 END) AS username_ip_failures,
                 SUM(CASE WHEN ip_hash = :ip_hash THEN 1 ELSE 0 END) AS ip_failures
             FROM pm_login_attempts
             WHERE succeeded = 0
@@ -42,7 +49,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
         ");
         $throttleStmt->execute(['username_hash' => $usernameHash, 'ip_hash' => $ipHash]);
         $throttle = $throttleStmt->fetch() ?: [];
-        $isThrottled = (int)($throttle['username_failures'] ?? 0) >= 8
+        $isThrottled = (int)($throttle['username_ip_failures'] ?? 0) >= 8
             || (int)($throttle['ip_failures'] ?? 0) >= 30;
 
         if ($isThrottled) {
@@ -54,8 +61,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
             // Verify against a valid bcrypt hash even for unknown accounts so
             // the response does not reveal whether a username exists by timing.
             $passwordHash = $user['password'] ?? '$2y$10$z7pKdikgHqWMYS9bIgDqKOB66143HfQ9Vlxss74CmDbpdoACAtF8K';
-            $passwordMatches = password_verify($password, $passwordHash);
-            $loginSucceeded = $user !== false && $passwordMatches;
+            $passwordMatches = password_verify($passwordTooLong ? '' : $password, $passwordHash);
+            $loginSucceeded = !$passwordTooLong && $user !== false && $passwordMatches;
 
             $attemptStmt = $pdo->prepare("
                 INSERT INTO pm_login_attempts(username_hash, ip_hash, succeeded)
@@ -77,6 +84,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
                 $_SESSION['user_id'] = (int)$user['id'];
                 $_SESSION['user_data'] = $user;
                 $_SESSION['auth_version'] = (int)($user['auth_version'] ?? 1);
+                $_SESSION['auth_issued_at'] = time();
+                $_SESSION['auth_last_activity_at'] = time();
                 unset($_SESSION['csrf_token']);
                 getCsrfToken();
 
@@ -155,14 +164,12 @@ function hasPerm($perm) {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?php echo htmlspecialchars(APP_NAME, ENT_QUOTES, 'UTF-8'); ?></title>
     <link rel="stylesheet" href="style.css?v=<?php echo app_asset_version('style.css'); ?>">
-    <script>
-        window.CURRENT_USER = <?php echo json_encode([
-            'name' => $currentUser['name'],
-            'role' => $currentUser['role'],
-            'permissions' => $userPerms
-        ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
-        window.NAWARA_CSRF_TOKEN = <?php echo json_encode($csrfToken, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
-    </script>
+    <meta name="nawara-current-user" content="<?php echo htmlspecialchars((string)json_encode([
+        'name' => $currentUser['name'],
+        'role' => $currentUser['role'],
+        'permissions' => $userPerms
+    ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
+    <meta name="nawara-csrf-token" content="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
 </head>
 <body>
 
@@ -193,7 +200,7 @@ function hasPerm($perm) {
             </div>
             
             <div class="user-menu">
-                <div class="user-badge-new" onclick="toggleUserMenu()">
+                <div class="user-badge-new" data-action="toggle-user-menu" role="button" tabindex="0">
                     <span class="user-avatar">👤</span>
                     <div class="user-info">
                         <span class="user-name"><?php echo htmlspecialchars($currentUser['name']); ?></span>
@@ -228,24 +235,27 @@ function hasPerm($perm) {
     <div class="toolbar-content">
         <div class="toolbar-left">
             <?php if (hasPerm('add')): ?>
-            <button class="btn btn-primary" onclick="openProjectForm()">
+            <button class="btn btn-primary" data-action="open-project-form">
                 <span>＋</span> Add New Project
             </button>
             <?php endif; ?>
 
             <?php if (hasPerm('edit')): ?>
-            <button class="btn btn-soft" onclick="openUpdateModal()">
+            <button class="btn btn-soft" data-action="open-update-modal">
                 <span>🛠</span> Update Project
             </button>
             <?php endif; ?>
 
-            <?php if (hasPerm('priorities')): ?>
-            <button class="btn btn-priorities" onclick="openPriorities()">
+            <?php if ($isAdmin): ?>
+            <button class="btn btn-priorities" data-action="open-priorities">
                 <span>🎯</span> Priorities
+            </button>
+            <button class="btn btn-soft" data-action="open-archived-projects" title="Restore archived projects">
+                <span>🗄</span> Archive
             </button>
             <?php endif; ?>
 
-            <button class="btn btn-secondary" onclick="loadProjects()">
+            <button class="btn btn-secondary" data-action="refresh-projects">
                 <span>↻</span> Refresh
             </button>
         </div>
@@ -253,18 +263,18 @@ function hasPerm($perm) {
         <div class="toolbar-right">
             <div class="search-wrap">
                 <span class="search-ico">🔍</span>
-                <input type="text" id="searchInput" placeholder="Search by name, client, zone..." onkeyup="handleSearch(event)">
-                <button class="search-go" onclick="searchProjects()">Search</button>
+                <input type="text" id="searchInput" placeholder="Search by name, client, zone..." data-action="project-search-input">
+                <button class="search-go" data-action="search-projects">Search</button>
             </div>
 
             <?php if ($isAdmin): ?>
-            <button class="settings-float" onclick="openUsersModal()" title="Users Management" style="background:linear-gradient(135deg,#10b981,#059669); margin-right:8px;">
+            <button class="settings-float" data-action="open-users-modal" title="Users Management" style="background:linear-gradient(135deg,#10b981,#059669); margin-right:8px;">
                 👥
             </button>
             <?php endif; ?>
 
             <?php if (hasPerm('settings')): ?>
-            <button class="settings-float" onclick="openSettings()" title="Settings">
+            <button class="settings-float" data-action="open-settings" title="Settings">
                 ⚙️
             </button>
             <?php endif; ?>
@@ -303,7 +313,7 @@ function hasPerm($perm) {
             <h3>No Projects Yet</h3>
             <p>Click the button below to add your first project</p>
             <?php if (hasPerm('add')): ?>
-            <button class="btn btn-primary" onclick="openProjectForm()">＋ Add New Project</button>
+            <button class="btn btn-primary" data-action="open-project-form">＋ Add New Project</button>
             <?php endif; ?>
         </div>
     </div>
@@ -379,10 +389,10 @@ function hasPerm($perm) {
     <div class="modal modal-xl">
         <div class="modal-head">
             <h2 id="modalTitle">Add New Project</h2>
-            <button class="modal-x" onclick="closeProjectForm()">✕</button>
+            <button class="modal-x" data-action="close-project-form">✕</button>
         </div>
         <div class="modal-body">
-            <form id="projectForm" onsubmit="return false;">
+            <form id="projectForm" data-action="project-form">
                 <input type="hidden" id="projectId" value="0">
                 <div class="fsec">
                     <div class="fsec-head no-click">
@@ -403,8 +413,8 @@ function hasPerm($perm) {
             </form>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeProjectForm()">Cancel</button>
-            <button class="btn btn-primary" onclick="saveProject()">💾 Save Project</button>
+            <button class="btn btn-secondary" data-action="close-project-form">Cancel</button>
+            <button class="btn btn-primary" data-action="save-project">💾 Save Project</button>
         </div>
     </div>
 </div>
@@ -414,7 +424,7 @@ function hasPerm($perm) {
     <div class="modal modal-sm">
         <div class="modal-head">
             <h2>🛠 Update Project</h2>
-            <button class="modal-x" onclick="closeOverlay('updateModal')">✕</button>
+            <button class="modal-x" data-action="close-overlay" data-overlay="updateModal">✕</button>
         </div>
         <div class="modal-body">
             <div class="fg">
@@ -423,8 +433,31 @@ function hasPerm($perm) {
             </div>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeOverlay('updateModal')">Cancel</button>
-            <button class="btn btn-primary" onclick="editSelectedProject()">Open Edit</button>
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="updateModal">Cancel</button>
+            <button class="btn btn-primary" data-action="edit-selected-project">Open Edit</button>
+        </div>
+    </div>
+</div>
+
+<!-- Archived Projects Modal (Head Admin only) -->
+<div class="overlay" id="archivedProjectsModal">
+    <div class="modal modal-xl">
+        <div class="modal-head">
+            <h2>🗄 Archived Projects</h2>
+            <button class="modal-x" type="button" data-action="close-overlay" data-overlay="archivedProjectsModal">✕</button>
+        </div>
+        <div class="modal-body">
+            <p style="margin-bottom:14px;color:#64748b;">Restoring keeps the project’s history, access assignments, files, and audit trail.</p>
+            <div class="table-responsive">
+                <table class="proj-table">
+                    <thead><tr><th>Project</th><th>Client</th><th>Archived</th><th>Reason</th><th>Action</th></tr></thead>
+                    <tbody id="archivedProjectsTableBody"></tbody>
+                </table>
+            </div>
+            <div class="files-empty" id="archivedProjectsEmpty" style="display:none;">No archived projects.</div>
+        </div>
+        <div class="modal-foot">
+            <button class="btn btn-secondary" type="button" data-action="close-overlay" data-overlay="archivedProjectsModal">Close</button>
         </div>
     </div>
 </div>
@@ -434,11 +467,11 @@ function hasPerm($perm) {
     <div class="modal modal-xl">
         <div class="modal-head">
             <h2 id="detailTitle">Project Details</h2>
-            <button class="modal-x" onclick="closeDetail()">✕</button>
+            <button class="modal-x" data-action="close-detail">✕</button>
         </div>
         <div class="modal-body" id="detailBody"></div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeDetail()">Close</button>
+            <button class="btn btn-secondary" data-action="close-detail">Close</button>
             <button class="btn btn-primary" id="detailEditBtn">✏️ Edit</button>
         </div>
     </div>
@@ -449,20 +482,20 @@ function hasPerm($perm) {
     <div class="modal modal-xl">
         <div class="modal-head">
             <h2>⚙️ Settings</h2>
-            <button class="modal-x" onclick="closeOverlay('settingsModal')">✕</button>
+            <button class="modal-x" data-action="close-overlay" data-overlay="settingsModal">✕</button>
         </div>
         <div class="modal-body">
             <div class="settings-tabs">
-                <button class="tab-btn active" onclick="showSettingsTab('engineers')">Engineers</button>
-                <button class="tab-btn" onclick="showSettingsTab('statuses')">Statuses</button>
-                <button class="tab-btn" onclick="showSettingsTab('sections')">Sections & Weights</button>
+                <button class="tab-btn active" data-action="show-settings-tab" data-tab="engineers">Engineers</button>
+                <button class="tab-btn" data-action="show-settings-tab" data-tab="statuses">Statuses</button>
+                <button class="tab-btn" data-action="show-settings-tab" data-tab="sections">Sections & Weights</button>
             </div>
             <div class="settings-panel active" id="settings-engineers"></div>
             <div class="settings-panel" id="settings-statuses"></div>
             <div class="settings-panel" id="settings-sections"></div>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeOverlay('settingsModal')">Close</button>
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="settingsModal">Close</button>
         </div>
     </div>
 </div>
@@ -472,23 +505,23 @@ function hasPerm($perm) {
     <div class="modal modal-xl">
         <div class="modal-head">
             <h2 id="filesTitle">📁 Project Files</h2>
-            <button class="modal-x" onclick="closeFilesModal()">✕</button>
+            <button class="modal-x" data-action="close-files-modal">✕</button>
         </div>
         <div class="modal-body">
             <input type="hidden" id="filesProjectId" value="0">
             <input type="hidden" id="filesCurrentPath" value="">
             <div class="fm-toolbar">
-                <button class="btn btn-primary btn-sm" onclick="fmCreateFolder()">📂 New Folder</button>
+                <button class="btn btn-primary btn-sm" data-action="file-create-folder">📂 New Folder</button>
                 <label class="btn btn-soft btn-sm" for="fmUploadInput">⬆ Upload Files</label>
-                <input id="fmUploadInput" type="file" multiple style="display:none;" onchange="fmUploadFiles(this.files)">
-                <button class="btn btn-secondary btn-sm" onclick="fmReload()">↻ Refresh</button>
-                <button class="btn btn-secondary btn-sm" onclick="fmGoHome()">🏠 Home</button>
+                <input id="fmUploadInput" type="file" multiple style="display:none;" data-action="file-upload-input">
+                <button class="btn btn-secondary btn-sm" data-action="file-reload">↻ Refresh</button>
+                <button class="btn btn-secondary btn-sm" data-action="file-home">🏠 Home</button>
             </div>
             <div class="fm-breadcrumbs" id="fmBreadcrumbs"></div>
             <div id="fmContent" class="fm-content"></div>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeFilesModal()">Close</button>
+            <button class="btn btn-secondary" data-action="close-files-modal">Close</button>
         </div>
     </div>
 </div>
@@ -498,20 +531,22 @@ function hasPerm($perm) {
     <div class="modal modal-lg">
         <div class="modal-head">
             <h2>🎯 Priorities - To Do List</h2>
-            <button class="modal-x" onclick="closeOverlay('prioritiesModal')">✕</button>
+            <button class="modal-x" data-action="close-overlay" data-overlay="prioritiesModal">✕</button>
         </div>
         <div class="modal-body">
             <div class="pri-stats" id="priStats"></div>
             <div class="pri-filter-bar">
-                <button class="pri-filter-btn active" onclick="priFilter('all', this)">All</button>
-                <button class="pri-filter-btn" onclick="priFilter('pending', this)">Pending</button>
-                <button class="pri-filter-btn" onclick="priFilter('done', this)">Completed</button>
+                <button class="pri-filter-btn active" data-action="priority-filter" data-filter="all">All</button>
+                <button class="pri-filter-btn" data-action="priority-filter" data-filter="pending">Pending</button>
+                <button class="pri-filter-btn" data-action="priority-filter" data-filter="done">Completed</button>
             </div>
             <div id="priTaskList" class="pri-task-list"></div>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeOverlay('prioritiesModal')">Close</button>
-            <button class="btn btn-primary" onclick="priShowAddForm()">＋ Add Task</button>
+            <button class="btn btn-secondary" type="button" data-action="close-overlay" data-overlay="prioritiesModal">Close</button>
+            <button class="btn btn-soft" type="button" data-action="priority-show-active">Active</button>
+            <button class="btn btn-soft" type="button" data-action="priority-show-archived">🗄 Archived</button>
+            <button class="btn btn-primary" type="button" data-action="priority-show-add">＋ Add Task</button>
         </div>
     </div>
 </div>
@@ -524,7 +559,7 @@ function hasPerm($perm) {
                 <h3>Add New Task</h3>
                 <p>Fill in the details below</p>
             </div>
-            <button class="pri-form-close" onclick="priHideAddForm()">✕</button>
+            <button class="pri-form-close" data-action="priority-hide-add">✕</button>
         </div>
         <div class="pri-form-body">
             <div class="fg"><label>Task Description *</label><input type="text" id="priNewTitle"></div>
@@ -541,8 +576,8 @@ function hasPerm($perm) {
             <div class="fg"><label>Due Date</label><input type="date" id="priNewDueDate"></div>
         </div>
         <div class="pri-form-foot">
-            <button class="btn btn-secondary" onclick="priHideAddForm()">Cancel</button>
-            <button class="btn btn-primary" onclick="priAddTask()">💾 Save</button>
+            <button class="btn btn-secondary" data-action="priority-hide-add">Cancel</button>
+            <button class="btn btn-primary" data-action="priority-add">💾 Save</button>
         </div>
     </div>
 </div>
@@ -552,11 +587,11 @@ function hasPerm($perm) {
     <div class="modal modal-lg">
         <div class="modal-head">
             <h2>👥 User Management</h2>
-            <button class="modal-x" onclick="closeOverlay('usersModal')">✕</button>
+            <button class="modal-x" data-action="close-overlay" data-overlay="usersModal">✕</button>
         </div>
         <div class="modal-body">
             <div style="margin-bottom:16px;">
-                <button class="btn btn-primary" onclick="openUserForm()">＋ Add New User</button>
+                <button class="btn btn-primary" data-action="open-user-form">＋ Add New User</button>
             </div>
             <table class="proj-table">
                 <thead><tr><th>Name</th><th>Username</th><th>Role / Group</th><th>Status</th><th>Actions</th></tr></thead>
@@ -564,7 +599,7 @@ function hasPerm($perm) {
             </table>
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeOverlay('usersModal')">Close</button>
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="usersModal">Close</button>
         </div>
     </div>
 </div>
@@ -574,14 +609,14 @@ function hasPerm($perm) {
     <div class="modal modal-xl">
         <div class="modal-head">
             <h2>👤 User Details</h2>
-            <button class="modal-x" onclick="closeOverlay('userFormModal')">✕</button>
+            <button class="modal-x" data-action="close-overlay" data-overlay="userFormModal">✕</button>
         </div>
         <div class="modal-body">
             <input type="hidden" id="u_id" value="0">
 
             <div class="settings-tabs" style="margin-bottom:20px;">
-                <button class="tab-btn active" onclick="showUserTab('info', this)">👤 Info</button>
-                <button class="tab-btn" onclick="showUserTab('perms', this)">🔐 Permissions</button>
+                <button class="tab-btn active" data-action="show-user-tab" data-tab="info">👤 Info</button>
+                <button class="tab-btn" data-action="show-user-tab" data-tab="perms">🔐 Permissions</button>
             </div>
 
             <!-- Tab: Info -->
@@ -592,14 +627,14 @@ function hasPerm($perm) {
                     <div class="fg"><label>Password <small style="color:#94a3b8;">(minimum 10 characters; leave empty if no change)</small></label><input type="password" id="u_password" minlength="10"></div>
                     <div class="fg">
                         <label>System Role</label>
-                        <select id="u_role" onchange="togglePerms()">
+                        <select id="u_role" data-action="toggle-permissions">
                             <option value="user">Employee / Restricted User</option>
                             <option value="admin">Admin / Head Engineer (Full Access)</option>
                         </select>
                     </div>
                     <div class="fg">
                         <label>Account Group</label>
-                        <select id="u_account_type" onchange="togglePerms()">
+                        <select id="u_account_type" data-action="toggle-permissions">
                             <option value="admin">Admin / Head Engineer</option>
                             <option value="employee">Employee</option>
                             <option value="client">Client / Project Owner</option>
@@ -617,7 +652,7 @@ function hasPerm($perm) {
                     <!-- بخش 1: See All Projects -->
                     <div style="background:#fef3c7; border:2px solid #f59e0b; padding:16px; border-radius:14px; margin-bottom:20px;">
                         <label style="display:flex; gap:10px; cursor:pointer; align-items:flex-start;">
-                            <input type="checkbox" id="p_view_all_projects" onchange="toggleProjectsList()" style="width:20px;height:20px;">
+                            <input type="checkbox" id="p_view_all_projects" data-action="toggle-project-list" style="width:20px;height:20px;">
                             <div>
                                 <div style="font-weight:900;">👁 See All Projects</div>
                                 <div style="font-size:.85rem; color:#92400e; margin-top:4px;">
@@ -658,8 +693,8 @@ function hasPerm($perm) {
 
         </div>
         <div class="modal-foot">
-            <button class="btn btn-secondary" onclick="closeOverlay('userFormModal')">Cancel</button>
-            <button class="btn btn-primary" onclick="saveUser()">💾 Save User</button>
+            <button class="btn btn-secondary" data-action="close-overlay" data-overlay="userFormModal">Cancel</button>
+            <button class="btn btn-primary" data-action="save-user">💾 Save User</button>
         </div>
     </div>
 </div>

@@ -17,7 +17,8 @@ NawAra is being evolved incrementally into a simple, installable construction-pr
 - [Notification matrix (Dari)](docs/03_NOTIFICATION_MATRIX_FA.md)
 - [Secure deployment guide (Dari)](docs/04_DEPLOYMENT_SECURITY_FA.md)
 - [Stage 2 test report (Dari)](docs/05_STAGE2_TEST_REPORT_FA.md)
+- [Phase 2.5 remediation test report (Dari)](docs/07_PHASE_2_5_REMEDIATION_TEST_REPORT_FA.md)
 
 ## Deployment note
 
-Before production deployment, read the secure deployment guide. In particular, configure `NAWARA_DATA_DIR` and `NAWARA_UPLOADS_DIR` outside the web document root, enable HTTPS and set a strong `NAWARA_INITIAL_ADMIN_PASSWORD` for a genuinely empty installation.
+Before production deployment, read the secure deployment guide. In particular, configure `NAWARA_DATA_DIR` and `NAWARA_UPLOADS_DIR` outside the web document root, enable HTTPS and set a strong `NAWARA_INITIAL_ADMIN_PASSWORD` for a genuinely empty installation. Production never runs schema migrations automatically: after taking and verifying a backup, set `NAWARA_ALLOW_SCHEMA_MIGRATIONS=1` only for the approved migration run, then remove it.
