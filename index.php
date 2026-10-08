@@ -178,7 +178,7 @@ function hasPerm($perm) {
     ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT), ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
     <meta name="nawara-csrf-token" content="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
 </head>
-<body>
+<body data-role="<?php echo $isAdmin ? 'admin' : 'employee'; ?>" data-user-id="<?php echo (int)($currentUser['id'] ?? 0); ?>">
 
 <header class="app-header">
     <div class="header-content">
@@ -259,8 +259,8 @@ function hasPerm($perm) {
             <?php endif; ?>
 
             <?php if ($isAdmin): ?>
-            <button class="btn btn-priorities" data-action="open-priorities">
-                <span>🎯</span> Priorities
+            <button class="btn btn-priorities" data-action="open-tasks">
+                <span>✅</span> Tasks
             </button>
             <button class="btn btn-soft" data-action="open-archived-projects" title="Restore archived projects">
                 <span>🗄</span> Archive
@@ -538,61 +538,7 @@ function hasPerm($perm) {
     </div>
 </div>
 
-<!-- Priorities Modal -->
-<div class="overlay" id="prioritiesModal">
-    <div class="modal modal-lg">
-        <div class="modal-head">
-            <h2>🎯 Priorities - To Do List</h2>
-            <button class="modal-x" data-action="close-overlay" data-overlay="prioritiesModal">✕</button>
-        </div>
-        <div class="modal-body">
-            <div class="pri-stats" id="priStats"></div>
-            <div class="pri-filter-bar">
-                <button class="pri-filter-btn active" data-action="priority-filter" data-filter="all">All</button>
-                <button class="pri-filter-btn" data-action="priority-filter" data-filter="pending">Pending</button>
-                <button class="pri-filter-btn" data-action="priority-filter" data-filter="done">Completed</button>
-            </div>
-            <div id="priTaskList" class="pri-task-list"></div>
-        </div>
-        <div class="modal-foot">
-            <button class="btn btn-secondary" type="button" data-action="close-overlay" data-overlay="prioritiesModal">Close</button>
-            <button class="btn btn-soft" type="button" data-action="priority-show-active">Active</button>
-            <button class="btn btn-soft" type="button" data-action="priority-show-archived">🗄 Archived</button>
-            <button class="btn btn-primary" type="button" data-action="priority-show-add">＋ Add Task</button>
-        </div>
-    </div>
-</div>
-
-<!-- Add Task Slide Panel -->
-<div class="pri-form-overlay" id="priAddForm">
-    <div class="pri-form-panel">
-        <div class="pri-form-head">
-            <div class="pri-form-head-text">
-                <h3>Add New Task</h3>
-                <p>Fill in the details below</p>
-            </div>
-            <button class="pri-form-close" data-action="priority-hide-add">✕</button>
-        </div>
-        <div class="pri-form-body">
-            <div class="fg"><label>Task Description *</label><input type="text" id="priNewTitle"></div>
-            <div class="fg"><label>Assigned To</label><select id="priNewAssignee"></select></div>
-            <div class="fg">
-                <label>Priority</label>
-                <select id="priNewPriority">
-                    <option value="critical">🔴 Critical</option>
-                    <option value="high">🟠 High</option>
-                    <option value="medium" selected>🟡 Medium</option>
-                    <option value="low">🟢 Low</option>
-                </select>
-            </div>
-            <div class="fg"><label>Due Date</label><input type="date" id="priNewDueDate"></div>
-        </div>
-        <div class="pri-form-foot">
-            <button class="btn btn-secondary" data-action="priority-hide-add">Cancel</button>
-            <button class="btn btn-primary" data-action="priority-add">💾 Save</button>
-        </div>
-    </div>
-</div>
+<?php require_once __DIR__ . '/tasks_ui_markup.php'; tasks_ui_markup(); ?>
 
 <!-- Users Modal -->
 <div class="overlay" id="usersModal">
@@ -714,6 +660,7 @@ function hasPerm($perm) {
 <div id="toastBox"></div>
 <div id="loadingBox"><div class="spin-wrap"><div class="spin"></div><p>Loading...</p></div></div>
 
+<script src="tasks-ui.js?v=<?php echo app_asset_version('tasks-ui.js'); ?>"></script>
 <script src="script.js?v=<?php echo app_asset_version('script.js'); ?>"></script>
 </body>
 </html>

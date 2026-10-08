@@ -58,6 +58,11 @@ function membershipPermissionsFromUserPermissions(array $permissions, string $ac
         ];
     }
 
+    // account_type 'admin' is the project/office admin scope; role=admin is
+    // short-circuited to full access everywhere else, but memberships still
+    // record the richer task permissions for consistency.
+    $isAdmin = ($accountType === 'admin');
+
     return [
         'view_project' => true,
         'edit_project' => !empty($permissions['edit']),
@@ -66,21 +71,22 @@ function membershipPermissionsFromUserPermissions(array $permissions, string $ac
         'download_reports' => !empty($permissions['pdf']),
         'view_files' => !empty($permissions['files']),
         'manage_files' => !empty($permissions['files']),
-        // Task permissions start deny-by-default and are granted only by the
-        // dedicated task/member management API in the next implementation stage.
-        'view_internal_tasks' => false,
-        'create_tasks' => false,
-        'edit_tasks' => false,
-        'assign_tasks' => false,
-        'update_own_assignment' => false,
-        'update_any_task' => false,
-        'submit_for_review' => false,
-        'review_tasks' => false,
-        'approve_tasks' => false,
-        'request_revision' => false,
+        // Task permissions (stage 3 defaults, approved permission matrix):
+        // employees always see their project's tasks, start/block/submit their
+        // own work; creating, assigning and approving stay deny-by-default.
+        'view_internal_tasks' => true,
+        'create_tasks' => $isAdmin,
+        'edit_tasks' => $isAdmin,
+        'assign_tasks' => $isAdmin,
+        'update_own_assignment' => true,
+        'update_any_task' => $isAdmin,
+        'submit_for_review' => true,
+        'review_tasks' => $isAdmin,
+        'approve_tasks' => $isAdmin,
+        'request_revision' => $isAdmin,
         'upload_files' => !empty($permissions['files']),
-        'publish_files_to_client' => false,
-        'manage_client_access' => false,
+        'publish_files_to_client' => $isAdmin,
+        'manage_client_access' => $isAdmin,
     ];
 }
 

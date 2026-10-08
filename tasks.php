@@ -77,6 +77,7 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Nawara Tasks</title>
+    <meta name="nawara-csrf-token" content="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>">
     <link rel="stylesheet" href="style.css?v=<?php echo app_asset_version('style.css'); ?>">
     <style>
         body.tasks-surface {
@@ -167,7 +168,7 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
         }
     </style>
 </head>
-<body class="tasks-surface">
+<body class="tasks-surface" data-role="<?php echo $currentUser['role'] === 'admin' ? 'admin' : 'employee'; ?>" data-user-id="<?php echo (int)($currentUser['id'] ?? 0); ?>">
 <header class="tasks-topbar">
     <div class="tasks-brand">
         <div class="tasks-logo">📋</div>
@@ -177,6 +178,7 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
         </div>
     </div>
     <div class="tasks-actions">
+        <button type="button" class="tasks-btn primary" data-action="open-tasks">✅ All Tasks</button>
         <?php if ($mayOpenCpm): ?>
             <a class="tasks-btn ghost" href="index.php">⟵ Nawara Studio — CPM</a>
         <?php endif; ?>
@@ -202,13 +204,13 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
     <?php else: ?>
         <div class="tasks-grid">
             <?php foreach ($memberships as $project): ?>
-                <div class="task-card">
+                <div class="task-card" data-tk-project="<?php echo (int)$project['id']; ?>">
                     <h3><?php echo $e($project['project_name']); ?></h3>
                     <p class="meta">
                         Client: <?php echo $e($project['client_name']); ?>
                         <?php if ($project['zone'] !== ''): ?> · Zone: <?php echo $e($project['zone']); ?><?php endif; ?>
                     </p>
-                    <span class="badge">0 tasks — arriving in stage 3</span>
+                    <span class="badge" data-tk-count>Loading tasks…</span>
                 </div>
             <?php endforeach; ?>
         </div>
@@ -218,5 +220,8 @@ $e = static fn(?string $value): string => htmlspecialchars((string)$value, ENT_Q
         Nawara Tasks will be installable as its own app (PWA) — offline capture, photos and reminders arrive in stages 5–7.
     </p>
 </main>
+
+<?php require_once __DIR__ . '/tasks_ui_markup.php'; tasks_ui_markup(); ?>
+<script src="tasks-ui.js?v=<?php echo app_asset_version('tasks-ui.js'); ?>"></script>
 </body>
 </html>

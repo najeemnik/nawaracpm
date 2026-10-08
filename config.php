@@ -646,6 +646,11 @@ function membershipAllows(array $membership, string $permission): bool
     // canonical permission names in the first branch above.
     $aliases = [
         'view_project' => ['view'],
+        // Any project member who can see the project can see its internal
+        // task list; write operations on tasks still require their own
+        // explicit permissions below. Employee visibility is further scoped
+        // to their own assignments in the tasks API.
+        'view_internal_tasks' => ['view_project', 'view'],
         'edit_project' => ['edit', 'edit_tasks', 'update_any_task'],
         'delete_project' => ['delete'],
         'print_reports' => ['print', 'view_reports'],
