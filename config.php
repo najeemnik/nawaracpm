@@ -470,6 +470,129 @@ function canDo(string $permission): bool
     return !empty($permissions[$permission]);
 }
 
+/* ============================================
+   Application surfaces (stage 2 routing)
+
+   One login, three separately installable surfaces:
+
+     Nawara Studio — CPM   index.php   (office / administration)
+     Nawara Tasks          tasks.php   (field / assigned work)
+     Nawara Client         client.php  (publish-gated project owner portal)
+
+   The surface is decided by permissions, never by display names:
+
+     - client account                      -> client portal only
+     - role=admin                          -> CPM + Tasks
+     - holds >=1 management permission     -> CPM + Tasks (project admin / office)
+     - everyone else (typical employee)    -> Tasks only
+
+   These helpers are pure decision functions; every page and API still
+   enforces its own server-side permission checks. Hiding a link is never
+   treated as access control.
+   ============================================ */
+
+/**
+ * Permissions that signal "this account administers the workspace" rather than
+ * "this account performs assigned work".
+ */
+function cpmManagementPermissions(): array
+{
+    return [
+        'manage_users', 'manage_templates', 'manage_notifications',
+        'view_audit_log', 'settings', 'view_all_projects',
+        'add', 'edit', 'delete',
+    ];
+}
+
+function canUseCpmApp(?array $user = null): bool
+{
+    $user = $user ?? getCurrentUser();
+    if ($user === null) {
+        return false;
+    }
+
+    // The client portal is a separate surface; a client never enters the
+    // internal workspace regardless of any stored permission flags.
+    if (isClientAccount($user)) {
+        return false;
+    }
+
+    if (isHeadAdmin($user)) {
+        return true;
+    }
+
+    $permissions = permissionMap($user['permissions'] ?? '{}');
+    foreach (cpmManagementPermissions() as $permission) {
+        if (!empty($permissions[$permission])) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function canUseTasksApp(?array $user = null): bool
+{
+    $user = $user ?? getCurrentUser();
+    return $user !== null && !isClientAccount($user);
+}
+
+function canUseClientPortal(?array $user = null): bool
+{
+    return isClientAccount($user);
+}
+
+/**
+ * Landing page for the authenticated user. Returns a script filename relative
+ * to the application root; every entry page redirects mismatches so a deep
+ * link can never park a user on the wrong surface.
+ */
+function landingPageForCurrentUser(?array $user = null): string
+{
+    $user = $user ?? getCurrentUser();
+    if ($user === null) {
+        return 'index.php';
+    }
+
+    if (canUseClientPortal($user)) {
+        return 'client.php';
+    }
+    if (canUseCpmApp($user)) {
+        return 'index.php';
+    }
+
+    return 'tasks.php';
+}
+
+/**
+ * Redirects the current request when the user is logged in but is looking at
+ * a surface their permissions do not allow. No-op for anonymous requests
+ * (the login screen lives on index.php).
+ *
+ *   client          -> only client.php
+ *   CPM-capable     -> index.php and tasks.php (admin sees both apps)
+ *   typical staff   -> tasks.php only
+ */
+function enforceSurfaceRouting(?array $user, string $currentScript): void
+{
+    if ($user === null) {
+        return;
+    }
+
+    if (canUseClientPortal($user)) {
+        $allowed = ['client.php'];
+    } elseif (canUseCpmApp($user)) {
+        $allowed = ['index.php', 'tasks.php'];
+    } else {
+        $allowed = ['tasks.php'];
+    }
+
+    if (!in_array($currentScript, $allowed, true)) {
+        header('Location: ' . landingPageForCurrentUser($user));
+        exit;
+    }
+}
+
 function getProjectMembership(int $projectId, ?int $userId = null): ?array
 {
     $user = getCurrentUser();

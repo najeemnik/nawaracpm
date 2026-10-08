@@ -103,6 +103,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
 
 $logoExists = file_exists(__DIR__ . '/logo.png');
 $currentUser = isLoggedIn() ? refreshCurrentUserSession() : null;
+
+// Stage 2 surface routing: every account type opens its own app. Employees
+// land on Nawara Tasks, clients on the client portal, CPM-capable staff here.
+if ($currentUser !== null) {
+    enforceSurfaceRouting($currentUser, 'index.php');
+}
+
 $csrfToken = getCsrfToken();
 
 // LOGIN PAGE
@@ -217,6 +224,11 @@ function hasPerm($perm) {
                             <div class="dropdown-role"><?php echo htmlspecialchars($currentUser['username']); ?></div>
                         </div>
                     </div>
+                    <div class="dropdown-divider"></div>
+                    <a class="dropdown-item dropdown-surface-link" href="tasks.php">
+                        <span>📋</span>
+                        <span>Nawara Tasks</span>
+                    </a>
                     <div class="dropdown-divider"></div>
                     <form method="post" class="logout-form">
                         <input type="hidden" name="csrf_token" value="<?php echo htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8'); ?>">
