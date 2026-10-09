@@ -5,6 +5,37 @@
  */
 
 require_once __DIR__ . '/config.php';
+require_once __DIR__ . '/migrations.php';
+
+/**
+ * Read-only readiness check used when production schema changes have not been
+ * explicitly approved. It deliberately performs no CREATE/ALTER/INSERT work.
+ */
+function databaseSchemaIsCurrent(PDO $pdo): bool
+{
+    try {
+        $ledgerExists = (bool)$pdo->query("
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'pm_schema_migrations'
+            LIMIT 1
+        ")->fetchColumn();
+        if (!$ledgerExists) {
+            return false;
+        }
+
+        $applied = $pdo->query('SELECT migration_id FROM pm_schema_migrations')->fetchAll(PDO::FETCH_COLUMN);
+        $appliedMap = array_fill_keys(array_map('strval', $applied), true);
+        foreach (array_keys(getDatabaseMigrations()) as $migrationId) {
+            if (!isset($appliedMap[$migrationId])) {
+                return false;
+            }
+        }
+        return true;
+    } catch (Throwable $e) {
+        return false;
+    }
+}
 
 function getDB(): PDO
 {
@@ -15,25 +46,55 @@ function getDB(): PDO
     }
 
     $dir = dirname(DB_PATH);
-    if (!is_dir($dir)) {
-        @mkdir($dir, 0755, true);
+    if (!is_dir($dir) || !is_writable($dir)) {
+        nawaraConfigurationError('Private database directory is unavailable');
     }
 
+    // Calculate this before opening SQLite: an unapproved fresh production
+    // deployment must not even create a new database file implicitly.
+    $allowSchemaWrites = APP_ENV !== 'production'
+        || in_array(strtolower((string)(getenv('NAWARA_ALLOW_SCHEMA_MIGRATIONS') ?: '')), ['1', 'true', 'yes'], true);
+
     try {
+        if (!$allowSchemaWrites && !is_file(DB_PATH)) {
+            throw new RuntimeException('Database schema migration is required before creating the production database.');
+        }
         $pdo = new PDO('sqlite:' . DB_PATH);
         $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+
+        // Production schema writes are opt-in. Check the migration ledger
+        // before executing any write-capable SQLite pragma or chmod operation,
+        // so an unapproved deployment remains read-only with respect to the
+        // authoritative database.
+        if (!$allowSchemaWrites && !databaseSchemaIsCurrent($pdo)) {
+            throw new RuntimeException(
+                'Database schema migration is required. Verify a backup and set NAWARA_ALLOW_SCHEMA_MIGRATIONS=1 for the approved migration run.'
+            );
+        }
+
         $pdo->exec('PRAGMA foreign_keys = ON');
         $pdo->exec('PRAGMA journal_mode = WAL');
+        $pdo->exec('PRAGMA busy_timeout = 5000');
+        $pdo->exec('PRAGMA secure_delete = ON');
+        $pdo->exec('PRAGMA trusted_schema = OFF');
+        $pdo->exec('PRAGMA recursive_triggers = ON');
+        if (file_exists(DB_PATH)) {
+            @chmod(DB_PATH, 0640);
+        }
 
-        createTables($pdo);
-        seedDefaultData($pdo);
+        if ($allowSchemaWrites) {
+            createTables($pdo);
+            runDatabaseMigrations($pdo);
+            seedDefaultData($pdo);
+        }
 
         return $pdo;
     } catch (Throwable $e) {
+        error_log('NawAra database initialization failed: ' . $e->getMessage());
         header('Content-Type: application/json; charset=UTF-8');
         http_response_code(500);
-        echo json_encode(['error' => 'Database connection failed: ' . $e->getMessage()], JSON_UNESCAPED_UNICODE);
+        echo json_encode(['error' => 'Database connection failed'], JSON_UNESCAPED_UNICODE);
         exit;
     }
 }
@@ -149,24 +210,29 @@ function createTables(PDO $pdo): void
 
 function seedDefaultData(PDO $pdo): void
 {
-    // ساخت ادمین پیش‌فرض اگر کاربری وجود نداشت
-    try {
-        $userCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users")->fetchColumn();
-        if ($userCount === 0) {
-            $stmt = $pdo->prepare("
-                INSERT INTO pm_users (name, username, password, role, permissions) 
-                VALUES (:name, :username, :password, :role, :permissions)
-            ");
-            $stmt->execute([
-                'name' => 'Administrator',
-                'username' => 'admin',
-                'password' => password_hash('NawAra@2025', PASSWORD_DEFAULT),
-                'role' => 'admin',
-                'permissions' => '{}'
-            ]);
+    // A fresh install must receive its bootstrap secret through the deployment
+    // environment. Never generate and leak an administrator password in logs.
+    $userCount = (int)$pdo->query("SELECT COUNT(*) FROM pm_users")->fetchColumn();
+    if ($userCount === 0) {
+        $initialPassword = (string)(getenv('NAWARA_INITIAL_ADMIN_PASSWORD') ?: '');
+        if (strlen($initialPassword) < 12) {
+            throw new RuntimeException('NAWARA_INITIAL_ADMIN_PASSWORD must be set to a password of at least 12 characters before first startup');
         }
-    } catch (Throwable $e) {
-        // Ignore
+
+        $stmt = $pdo->prepare("
+            INSERT INTO pm_users
+                (name, username, password, role, account_type, permissions, auth_version, password_changed_at, updated_at)
+            VALUES
+                (:name, :username, :password, :role, 'admin', :permissions, 1,
+                 datetime('now','localtime'), datetime('now','localtime'))
+        ");
+        $stmt->execute([
+            'name' => 'Administrator',
+            'username' => 'admin',
+            'password' => password_hash($initialPassword, PASSWORD_DEFAULT),
+            'role' => 'admin',
+            'permissions' => '{}'
+        ]);
     }
 
     // Status های پیش‌فرض
@@ -398,8 +464,10 @@ function calculateProjectSummary(PDO $pdo, int $projectId): array
         $statusMap[(int)$s['id']] = $s;
     }
 
+    $progressMode = projectProgressMode($pdo, $projectId);
+
     $stmt = $pdo->prepare("
-        SELECT item_id, status_id
+        SELECT item_id, status_id, task_percent
         FROM pm_project_values
         WHERE project_id = :project_id
     ");
@@ -427,8 +495,18 @@ function calculateProjectSummary(PDO $pdo, int $projectId): array
             $totalItemWeight += $itemWeight;
 
             $itemId = (int)$item['id'];
-            $statusId = isset($valueMap[$itemId]) ? (int)$valueMap[$itemId]['status_id'] : 0;
-            $percent = isset($statusMap[$statusId]) ? (int)$statusMap[$statusId]['percent'] : 0;
+            $value = $valueMap[$itemId] ?? null;
+
+            // task_driven projects use the exact task-derived percent when the
+            // item has linked progress tasks; everything else stays manual.
+            if ($progressMode === 'task_driven'
+                && $value !== null
+                && (float)($value['task_percent'] ?? -1) >= 0) {
+                $percent = (float)$value['task_percent'];
+            } else {
+                $statusId = $value !== null ? (int)$value['status_id'] : 0;
+                $percent = isset($statusMap[$statusId]) ? (int)$statusMap[$statusId]['percent'] : 0;
+            }
 
             $itemWeighted += ($percent * $itemWeight);
         }
@@ -471,13 +549,236 @@ function updateProjectProgress(PDO $pdo, int $projectId): int
     return $progress;
 }
 
+function projectProgressMode(PDO $pdo, int $projectId): string
+{
+    $stmt = $pdo->prepare('SELECT progress_mode FROM pm_projects WHERE id = :id LIMIT 1');
+    $stmt->execute(['id' => $projectId]);
+    $mode = (string)($stmt->fetchColumn() ?: 'manual');
+    return in_array($mode, ['manual', 'task_driven'], true) ? $mode : 'manual';
+}
+
+/** Closest active status for a computed percent (ties resolve upward). */
+function mapPercentToStatusId(array $statuses, float $percent): ?int
+{
+    $best = null;
+    $bestDelta = null;
+    foreach ($statuses as $status) {
+        $delta = abs((float)$status['percent'] - $percent);
+        if ($bestDelta === null
+            || $delta < $bestDelta - 1e-9
+            || (abs($delta - $bestDelta) <= 1e-9 && (float)$status['percent'] > (float)$best['percent'])) {
+            $best = $status;
+            $bestDelta = $delta;
+        }
+    }
+    return $best !== null ? (int)$best['id'] : null;
+}
+
+/**
+ * Recompute task-derived percent for the given item(s) of a task_driven
+ * project and persist it into pm_project_values (the current item table),
+ * then refresh pm_projects.progress. Manual projects are never touched.
+ *
+ * Callers run this inside their own transaction so a task transition and its
+ * progress side-effects commit (or roll back) together.
+ */
+function syncTaskProgress(PDO $pdo, int $projectId, ?int $itemId = null, ?int $previousItemId = null): void
+{
+    if (projectProgressMode($pdo, $projectId) !== 'task_driven') {
+        return;
+    }
+
+    $items = [];
+    foreach ([$itemId, $previousItemId] as $candidate) {
+        $candidate = (int)($candidate ?? 0);
+        if ($candidate > 0) {
+            $items[$candidate] = $candidate;
+        }
+    }
+    if ($items === []) {
+        updateProjectProgress($pdo, $projectId);
+        return;
+    }
+
+    $meta = fetchMeta($pdo);
+    $knownItems = [];
+    foreach ($meta['sections'] as $section) {
+        foreach ($section['items'] as $item) {
+            $knownItems[(int)$item['id']] = true;
+        }
+    }
+    $statuses = $meta['statuses'];
+
+    $tasksStmt = $pdo->prepare("
+        SELECT status, progress_weight
+        FROM pm_tasks
+        WHERE project_id = :project_id AND item_id = :item_id
+          AND affects_project_progress = 1
+          AND status != 'cancelled'
+    ");
+    $findValue = $pdo->prepare('
+        SELECT id FROM pm_project_values
+        WHERE project_id = :project_id AND item_id = :item_id
+        LIMIT 1
+    ');
+    $insertValue = $pdo->prepare("
+        INSERT INTO pm_project_values
+            (project_id, item_id, status_id, assignee_id, comment, task_percent, report_date, updated_at)
+        VALUES (:project_id, :item_id, :status_id, NULL, '', :task_percent, :report_date, datetime('now','localtime'))
+    ");
+    $updateValue = $pdo->prepare("
+        UPDATE pm_project_values
+        SET task_percent = :task_percent,
+            status_id = COALESCE(:status_id, status_id),
+            report_date = :report_date,
+            updated_at = datetime('now','localtime')
+        WHERE project_id = :project_id AND item_id = :item_id
+    ");
+    $resetValue = $pdo->prepare("
+        UPDATE pm_project_values
+        SET task_percent = -1, updated_at = datetime('now','localtime')
+        WHERE project_id = :project_id AND item_id = :item_id AND task_percent >= 0
+    ");
+
+    foreach ($items as $iid) {
+        if (!isset($knownItems[$iid])) {
+            continue;
+        }
+
+        $tasksStmt->execute(['project_id' => $projectId, 'item_id' => $iid]);
+        $tasks = $tasksStmt->fetchAll();
+
+        if ($tasks === []) {
+            // No progress tasks remain on this item: hand control back to the
+            // manual status (task_percent = -1 means "no task data").
+            $resetValue->execute(['project_id' => $projectId, 'item_id' => $iid]);
+            continue;
+        }
+
+        $totalWeight = 0.0;
+        $doneWeight = 0.0;
+        $doneCount = 0;
+        foreach ($tasks as $task) {
+            $weight = max(0.0, (float)$task['progress_weight']);
+            $totalWeight += $weight;
+            $isDone = (string)$task['status'] === 'completed';
+            if ($isDone) {
+                $doneWeight += $weight;
+                $doneCount++;
+            }
+        }
+        if ($totalWeight > 0) {
+            $percent = max(0.0, min(100.0, ($doneWeight / $totalWeight) * 100.0));
+        } else {
+            // Zero weights everywhere: count completed tasks instead.
+            $percent = ($doneCount / count($tasks)) * 100.0;
+        }
+
+        $statusId = mapPercentToStatusId($statuses, $percent);
+        $reportDate = date('Y-m-d');
+
+        $findValue->execute(['project_id' => $projectId, 'item_id' => $iid]);
+        $row = $findValue->fetch();
+        if ($row) {
+            $updateValue->execute([
+                'task_percent' => $percent,
+                'status_id' => $statusId,
+                'report_date' => $reportDate,
+                'project_id' => $projectId,
+                'item_id' => $iid,
+            ]);
+        } else {
+            $insertValue->execute([
+                'project_id' => $projectId,
+                'item_id' => $iid,
+                'status_id' => $statusId,
+                'task_percent' => $percent,
+                'report_date' => $reportDate,
+            ]);
+        }
+    }
+
+    updateProjectProgress($pdo, $projectId);
+}
+
+/** Recompute every item of a project that has linked progress tasks. */
+function syncAllTaskDrivenItems(PDO $pdo, int $projectId): void
+{
+    if (projectProgressMode($pdo, $projectId) !== 'task_driven') {
+        return;
+    }
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT item_id
+        FROM pm_tasks
+        WHERE project_id = :project_id
+          AND item_id IS NOT NULL AND item_id > 0
+          AND affects_project_progress = 1
+          AND status != 'cancelled'
+    ");
+    $stmt->execute(['project_id' => $projectId]);
+    foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $iid) {
+        syncTaskProgress($pdo, $projectId, (int)$iid);
+    }
+    updateProjectProgress($pdo, $projectId);
+}
+
+/**
+ * Award progress points to a completed task's internal members.
+ * Points = the project-progress delta the approval produced (stage 5 scope:
+ * "score matches the % the project rose"). Manual projects never move, so
+ * they naturally award nothing. One award per (task, member).
+ */
+function awardTaskProgressScore(PDO $pdo, int $projectId, int $taskId, int $progressBefore): void
+{
+    $after = (int)calculateProjectSummary($pdo, $projectId)['overall'];
+    $delta = round($after - $progressBefore, 2);
+    if ($delta <= 0) {
+        return;
+    }
+
+    $stmt = $pdo->prepare("
+        SELECT DISTINCT a.user_id
+        FROM pm_task_assignees a
+        INNER JOIN pm_users u ON u.id = a.user_id
+        WHERE a.task_id = :task_id
+          AND u.active = 1
+          AND u.account_type != 'client'
+        ORDER BY a.user_id
+    ");
+    $stmt->execute(['task_id' => $taskId]);
+    $memberIds = array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+    if ($memberIds === []) {
+        return;
+    }
+
+    $share = round($delta / count($memberIds), 2);
+    if ($share <= 0) {
+        return;
+    }
+    $insert = $pdo->prepare("
+        INSERT OR IGNORE INTO pm_task_score_events
+            (project_id, task_id, user_id, points, progress_before, progress_after)
+        VALUES (:project_id, :task_id, :user_id, :points, :before, :after)
+    ");
+    foreach ($memberIds as $uid) {
+        $insert->execute([
+            'project_id' => $projectId,
+            'task_id' => $taskId,
+            'user_id' => $uid,
+            'points' => $share,
+            'before' => $progressBefore,
+            'after' => $after,
+        ]);
+    }
+}
+
 function getProjectPayload(PDO $pdo, int $id): ?array
 {
     $stmt = $pdo->prepare("
         SELECT p.*, e.name AS lead_engineer_name
         FROM pm_projects p
         LEFT JOIN pm_engineers e ON e.id = p.lead_engineer_id
-        WHERE p.id = :id
+        WHERE p.id = :id AND p.deleted_at = ''
         LIMIT 1
     ");
     $stmt->execute(['id' => $id]);
